@@ -1,10 +1,12 @@
 import unittest
+from io import BytesIO
 from datetime import date, datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from app.main import (app, category_choice, daily_yield_cents, materialize_fixed_bills,
+from app.main import (app, bcb_observations, category_choice, daily_yield_cents, materialize_fixed_bills,
                       materialize_fixed_incomes, monthly_payables, monthly_receivables,
                       verify_password, yield_start)
 
@@ -107,6 +109,13 @@ class ApiTests(unittest.TestCase):
         zone = ZoneInfo("America/Sao_Paulo")
         self.assertEqual(yield_start(datetime(2026, 10, 14, 7, 59, tzinfo=zone)), date(2026, 10, 14))
         self.assertEqual(yield_start(datetime(2026, 10, 14, 8, 0, tzinfo=zone)), date(2026, 10, 15))
+
+    def test_bcb_rate_ignores_future_values_and_preserves_observation_date(self):
+        payload = b'[{"data":"13/10/2026","valor":"13.65"},{"data":"15/10/2026","valor":"14.00"}]'
+        with patch("app.main.urlopen", return_value=BytesIO(payload)) as request:
+            self.assertEqual(bcb_observations("cdi", date(2026, 10, 14)), [(date(2026, 10, 13), 1365)])
+        self.assertIn("bcdata.sgs.4389", request.call_args.args[0])
+        self.assertIn("dataFinal=14%2F10%2F2026", request.call_args.args[0])
 
 
 if __name__ == "__main__":

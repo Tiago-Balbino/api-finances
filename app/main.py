@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -10,6 +11,8 @@ from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -287,6 +290,7 @@ def monthly_receivables(incomes: list[dict], current: date) -> list[dict]:
 
 
 YIELD_ZONE = ZoneInfo("America/Sao_Paulo")
+BCB_SERIES = {"cdi": 4389, "selic_target": 432}
 
 
 def yield_clock() -> datetime:
@@ -295,6 +299,54 @@ def yield_clock() -> datetime:
 
 def yield_start(now: datetime) -> date:
     return now.date() + timedelta(days=1 if now.time() >= clock_time(8) else 0)
+
+
+def bcb_observations(source_code: str, as_of: date) -> list[tuple[date, int]]:
+    if source_code not in BCB_SERIES:
+        fail(400, "Indicador inválido.")
+    params = urlencode({"formato": "json", "dataInicial": (as_of - timedelta(days=35)).strftime("%d/%m/%Y"),
+        "dataFinal": as_of.strftime("%d/%m/%Y")})
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{BCB_SERIES[source_code]}/dados?{params}"
+    with urlopen(url, timeout=8) as response:
+        records = json.load(response)
+    if not isinstance(records, list) or not records:
+        raise ValueError("O Banco Central não retornou valores para o indicador.")
+    result = []
+    for item in records:
+        when = datetime.strptime(item["data"], "%d/%m/%Y").date()
+        points = int((Decimal(str(item["valor"]).replace(",", ".")) * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+        if when <= as_of and 0 <= points <= 10000:
+            result.append((when, points))
+    if not result:
+        raise ValueError("O Banco Central não retornou uma taxa válida até hoje.")
+    return sorted(result)
+
+
+def save_bcb_observations(db, source_code: str, records: list[tuple[date, int]]):
+    for when, points in records:
+        db.execute("""INSERT INTO yield_rate_observations(source_code,date,annual_basis_points)
+            VALUES(%s,%s,%s) ON CONFLICT (source_code,date)
+            DO UPDATE SET annual_basis_points=EXCLUDED.annual_basis_points""", (source_code, when, points))
+
+
+def sync_dynamic_rates(db, as_of: date | None = None, force: bool = False) -> dict:
+    as_of = as_of or yield_clock().date()
+    rates = all_rows(db, "SELECT id,source_code,last_checked_at FROM yield_rates WHERE source_code IS NOT NULL FOR UPDATE")
+    due = {item["source_code"] for item in rates
+        if force or not item["last_checked_at"] or item["last_checked_at"].astimezone(YIELD_ZONE).date() < as_of}
+    errors = {}
+    for source_code in due:
+        try:
+            records = bcb_observations(source_code, as_of)
+            save_bcb_observations(db, source_code, records)
+            when, points = records[-1]
+            db.execute("""UPDATE yield_rates SET annual_basis_points=%s,source_date=%s,
+                last_checked_at=now(),sync_error='' WHERE source_code=%s""", (points, when, source_code))
+        except (OSError, ValueError, ArithmeticError, KeyError, TypeError) as error:
+            errors[source_code] = str(error)[:200]
+            db.execute("UPDATE yield_rates SET last_checked_at=now(),sync_error=%s WHERE source_code=%s",
+                ("Não foi possível consultar o Banco Central. O último valor conhecido foi mantido.", source_code))
+    return {"updated": sorted(due - errors.keys()), "errors": errors}
 
 
 def daily_yield_cents(balance_cents: int, annual_basis_points: int, multiplier_basis_points: int) -> int:
@@ -311,7 +363,7 @@ def daily_yield_cents(balance_cents: int, annual_basis_points: int, multiplier_b
 def accrue_passive_yields(db, now: datetime | None = None) -> int:
     now = now or yield_clock()
     cutoff = now.date() if now.time() >= clock_time(8) else now.date() - timedelta(days=1)
-    accounts = all_rows(db, """SELECT a.*,r.name AS rate_name,r.annual_basis_points
+    accounts = all_rows(db, """SELECT a.*,r.name AS rate_name,r.annual_basis_points,r.source_code
         FROM accounts a JOIN yield_rates r ON r.id=a.yield_rate_id
         WHERE a.yield_start_date IS NOT NULL AND a.yield_start_date <= %s
         ORDER BY a.id FOR UPDATE OF a""", (cutoff,))
@@ -328,7 +380,11 @@ def accrue_passive_yields(db, now: datetime | None = None) -> int:
                     FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id
                     AND (t.date < %s OR (t.date = %s AND t.created_at <= %s))
                     WHERE a.id=%s GROUP BY a.id""", (current, current, at_eight, account["id"]))["cents"]
-                amount = daily_yield_cents(balance, account["annual_basis_points"],
+                observation = one(db, """SELECT annual_basis_points FROM yield_rate_observations
+                    WHERE source_code=%s AND date<=%s ORDER BY date DESC LIMIT 1""",
+                    (account["source_code"], current)) if account["source_code"] else None
+                annual_points = observation["annual_basis_points"] if observation else account["annual_basis_points"]
+                amount = daily_yield_cents(balance, annual_points,
                     account["yield_multiplier_basis_points"])
                 transaction_id = None
                 if amount:
@@ -336,7 +392,7 @@ def accrue_passive_yields(db, now: datetime | None = None) -> int:
                         note,amount_cents,date) VALUES(%s,'income',%s,'Investimentos',%s,%s,%s,%s) RETURNING id""",
                         (account["id"], f"Rendimento: {account['name']}", category["id"] if category else None,
                          f"{account['yield_multiplier_basis_points'] / 100:g}% de {account['rate_name']}"
-                         f" ({account['annual_basis_points'] / 100:g}% a.a.)", amount, current))
+                         f" ({annual_points / 100:g}% a.a.)", amount, current))
                     transaction_id = result["id"]
                     created += 1
                 db.execute("INSERT INTO passive_yields(account_id,date,amount_cents,transaction_id) VALUES(%s,%s,%s,%s)",
@@ -427,6 +483,7 @@ def state(who=Depends(user), db=Depends(db_session)):
     current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
     materialize_fixed_bills(db, current)
     materialize_fixed_incomes(db, current)
+    sync_dynamic_rates(db, current)
     accrue_passive_yields(db)
     accounts = all_rows(db, """SELECT a.*,r.name AS yield_rate_name,r.annual_basis_points AS yield_annual_basis_points,
         a.opening_cents + COALESCE(SUM(CASE WHEN t.date>%s THEN 0
@@ -448,7 +505,8 @@ def state(who=Depends(user), db=Depends(db_session)):
     bills = bill_rows(db, current)
     incomes = income_rows(db, current)
     categories = all_rows(db, "SELECT id,kind,name FROM categories ORDER BY kind,name")
-    yield_rates = all_rows(db, "SELECT id,name,annual_basis_points FROM yield_rates ORDER BY name")
+    yield_rates = all_rows(db, """SELECT id,name,annual_basis_points,source_code,source_date,
+        last_checked_at,sync_error FROM yield_rates ORDER BY name""")
     subcategories = all_rows(db, "SELECT id,category_id,name FROM subcategories ORDER BY name")
     month_start = current.replace(day=1)
     month_end = add_months(month_start, 1)
@@ -482,7 +540,8 @@ def scheduled_passive_yields(request: Request, db=Depends(db_session)):
     authorization = request.headers.get("authorization", "")
     if not secret or not hmac.compare_digest(authorization, f"Bearer {secret}"):
         fail(401, "Cron não autorizado.")
-    return {"created": accrue_passive_yields(db)}
+    sync = sync_dynamic_rates(db, yield_clock().date(), force=True)
+    return {"created": accrue_passive_yields(db), "rates": sync}
 
 
 @app.post("/api/categories", status_code=201)
@@ -545,6 +604,7 @@ def create_account(value: dict, who=Depends(mutation), db=Depends(db_session)):
 
 @app.patch("/api/accounts/{account_id}")
 def edit_account(account_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    sync_dynamic_rates(db, yield_clock().date())
     accrue_passive_yields(db)
     existing = one(db, "SELECT * FROM accounts WHERE id=%s FOR UPDATE", (account_id,))
     if not existing:
@@ -581,16 +641,53 @@ def account_yield_choice(db, value: dict):
 
 @app.post("/api/yield-rates", status_code=201)
 def create_yield_rate(value: dict, who=Depends(mutation), db=Depends(db_session)):
-    result = one(db, "INSERT INTO yield_rates(name,annual_basis_points) VALUES(%s,%s) RETURNING id",
-        (text(value.get("name"), "Nome da taxa", 80), integer(value.get("annualBasisPoints"), "Taxa anual", 0, 10000)))
+    source_code = value.get("sourceCode") or None
+    if source_code is not None and source_code not in BCB_SERIES:
+        fail(400, "Indicador inválido.")
+    if source_code:
+        try:
+            records = bcb_observations(source_code, yield_clock().date())
+        except (OSError, ValueError, ArithmeticError, KeyError, TypeError) as error:
+            fail(503, f"Não foi possível consultar o Banco Central: {error}")
+        save_bcb_observations(db, source_code, records)
+        source_date, points = records[-1]
+    else:
+        source_date = None
+        points = integer(value.get("annualBasisPoints"), "Taxa anual", 0, 10000)
+    result = one(db, """INSERT INTO yield_rates(name,annual_basis_points,source_code,source_date,last_checked_at)
+        VALUES(%s,%s,%s,%s,%s) RETURNING id""",
+        (text(value.get("name"), "Nome da taxa", 80), points, source_code, source_date,
+         yield_clock() if source_code else None))
     return {"id": result["id"]}
+
+
+@app.post("/api/yield-rates/sync")
+def sync_yield_rates(who=Depends(mutation), db=Depends(db_session)):
+    result = sync_dynamic_rates(db, yield_clock().date(), force=True)
+    return result
 
 
 @app.patch("/api/yield-rates/{rate_id}")
 def edit_yield_rate(rate_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    sync_dynamic_rates(db, yield_clock().date())
     accrue_passive_yields(db)
-    if not one(db, "UPDATE yield_rates SET name=%s,annual_basis_points=%s WHERE id=%s RETURNING id",
-        (text(value.get("name"), "Nome da taxa", 80), integer(value.get("annualBasisPoints"), "Taxa anual", 0, 10000), rate_id)):
+    source_code = value.get("sourceCode") or None
+    if source_code is not None and source_code not in BCB_SERIES:
+        fail(400, "Indicador inválido.")
+    if source_code:
+        try:
+            records = bcb_observations(source_code, yield_clock().date())
+        except (OSError, ValueError, ArithmeticError, KeyError, TypeError) as error:
+            fail(503, f"Não foi possível consultar o Banco Central: {error}")
+        save_bcb_observations(db, source_code, records)
+        source_date, points = records[-1]
+    else:
+        source_date = None
+        points = integer(value.get("annualBasisPoints"), "Taxa anual", 0, 10000)
+    if not one(db, """UPDATE yield_rates SET name=%s,annual_basis_points=%s,source_code=%s,
+        source_date=%s,last_checked_at=%s,sync_error='' WHERE id=%s RETURNING id""",
+        (text(value.get("name"), "Nome da taxa", 80), points, source_code, source_date,
+         yield_clock() if source_code else None, rate_id)):
         fail(404, "Taxa não encontrada.")
     return {"ok": True}
 

@@ -26,6 +26,16 @@ CREATE TABLE IF NOT EXISTS yield_rates (
   annual_basis_points INTEGER NOT NULL CHECK (annual_basis_points >= 0 AND annual_basis_points <= 10000)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS yield_rates_name_idx ON yield_rates(lower(name));
+ALTER TABLE yield_rates ADD COLUMN IF NOT EXISTS source_code TEXT CHECK (source_code IN ('cdi', 'selic_target'));
+ALTER TABLE yield_rates ADD COLUMN IF NOT EXISTS source_date DATE;
+ALTER TABLE yield_rates ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+ALTER TABLE yield_rates ADD COLUMN IF NOT EXISTS sync_error TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS yield_rate_observations (
+  source_code TEXT NOT NULL CHECK (source_code IN ('cdi', 'selic_target')),
+  date DATE NOT NULL,
+  annual_basis_points INTEGER NOT NULL CHECK (annual_basis_points BETWEEN 0 AND 10000),
+  PRIMARY KEY (source_code,date)
+);
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_rate_id BIGINT REFERENCES yield_rates(id) ON DELETE RESTRICT;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_multiplier_basis_points INTEGER NOT NULL DEFAULT 10000
   CHECK (yield_multiplier_basis_points BETWEEN 0 AND 100000);
@@ -147,6 +157,8 @@ ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subcategories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bills ENABLE ROW LEVEL SECURITY;
+ALTER TABLE planned_incomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE investments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE yield_rates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE yield_rate_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE passive_yields ENABLE ROW LEVEL SECURITY;
