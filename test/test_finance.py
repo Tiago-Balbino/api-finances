@@ -2,7 +2,7 @@ import unittest
 from datetime import date
 
 from app.finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, projected_cents,
-                         split_installments)
+                         simulate_payoff, split_installments)
 
 
 class FinanceTests(unittest.TestCase):
@@ -69,6 +69,40 @@ class FinanceTests(unittest.TestCase):
     def test_installments_sum_exactly_with_remainder_first(self):
         self.assertEqual(split_installments(1000, 3), [334, 333, 333])
         self.assertEqual(sum(split_installments(99999, 7)), 99999)
+
+    def debt(self, id, due, amount, rate=0):
+        return {"id": id, "description": f"D{id}", "due_date": due, "amount_cents": amount,
+                "interest_rate_basis_points": rate, "interest_period": "monthly", "payments": []}
+
+    def test_simulation_pays_highest_interest_first_and_reports_payoff(self):
+        today = date(2026, 10, 14)
+        bills = [self.debt(1, date(2026, 9, 10), 50000), self.debt(2, date(2026, 9, 20), 50000, rate=500)]
+        incomes = [{"due_date": date(2026, 11, 5), "amount_cents": 60000, "description": "Salário"},
+                   {"due_date": date(2026, 12, 5), "amount_cents": 60000, "description": "Salário"}]
+        result = simulate_payoff(10000, bills, incomes, today, months=12)
+        october = result["timeline"][0]
+        self.assertEqual(october["payments"][0]["description"], "D2")  # 5% a.m. antes da sem juros
+        self.assertEqual(result["payoff_date"], date(2026, 12, 5))
+        self.assertEqual(result["months_to_payoff"], 2)
+        self.assertGreater(result["interest_cents"], 0)
+        self.assertEqual(result["total_paid_cents"], 100000 + result["interest_cents"])
+
+    def test_simulation_without_enough_income_never_pays_off(self):
+        today = date(2026, 10, 14)
+        bills = [self.debt(1, date(2026, 9, 10), 500000, rate=300)]
+        incomes = [{"due_date": date(2026, 11, 5), "amount_cents": 1000, "description": "Bico"}]
+        result = simulate_payoff(0, bills, incomes, today, months=6)
+        self.assertIsNone(result["payoff_date"])
+        self.assertGreater(result["unpaid_at_horizon_cents"], 500000)
+        self.assertEqual(len(result["timeline"]), 6)
+
+    def test_future_bill_paid_on_due_date_is_not_late(self):
+        today = date(2026, 10, 14)
+        bills = [self.debt(1, date(2026, 11, 10), 30000, rate=1000)]
+        incomes = [{"due_date": date(2026, 11, 5), "amount_cents": 30000, "description": "Salário"}]
+        result = simulate_payoff(0, bills, incomes, today, months=12)
+        self.assertEqual(result["months_to_payoff"], 0)
+        self.assertEqual(result["interest_cents"], 0)
 
 
 if __name__ == "__main__":

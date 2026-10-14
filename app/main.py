@@ -24,7 +24,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from .finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, projected_cents,
-                      split_installments, today)
+                      simulate_payoff, split_installments, today)
 
 
 def database_url() -> str:
@@ -93,10 +93,10 @@ def json_default(value: Any):
     raise TypeError(f"Tipo não serializável: {type(value).__name__}")
 
 
-def json_response(payload: Any) -> Response:
+def json_response(payload: Any, status: int = 200) -> Response:
     # json.dumps runs in C; jsonable_encoder walks every value in Python and dominated large responses.
     return Response(json.dumps(payload, default=json_default, separators=(",", ":"), ensure_ascii=False),
-        media_type="application/json")
+        media_type="application/json", status_code=status)
 
 
 def fail(status: int, message: str):
@@ -295,9 +295,10 @@ def bill_rows(db, as_of: date):
     return result
 
 
-def missing_recurrences(origins: list[dict], existing: set[tuple[int, date]], as_of: date) -> list[tuple[dict, date]]:
-    """Monthly occurrences (origin, due date) still to be created up to the forecast horizon."""
-    last_month = add_months(as_of.replace(day=1), FORECAST_MONTHS - 1)
+def missing_recurrences(origins: list[dict], existing: set[tuple[int, date]], as_of: date,
+                        months: int = FORECAST_MONTHS) -> list[tuple[dict, date]]:
+    """Monthly occurrences (origin, due date) still to be created up to the horizon."""
+    last_month = add_months(as_of.replace(day=1), months - 1)
     result = []
     for origin in origins:
         month_count = (last_month.year - origin["due_date"].year) * 12 + last_month.month - origin["due_date"].month
@@ -308,8 +309,8 @@ def missing_recurrences(origins: list[dict], existing: set[tuple[int, date]], as
     return result
 
 
-def recurrence_state(db, table: str, type_column: str, as_of: date):
-    horizon = add_months(as_of.replace(day=1), FORECAST_MONTHS)
+def recurrence_state(db, table: str, type_column: str, as_of: date, months: int = FORECAST_MONTHS):
+    horizon = add_months(as_of.replace(day=1), months)
     origins = all_rows(db, f"""SELECT * FROM {table} WHERE {type_column}='fixed'
         AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
         AND due_date < %s ORDER BY id""", (horizon,))
@@ -319,7 +320,7 @@ def recurrence_state(db, table: str, type_column: str, as_of: date):
     existing = {(row["recurrence_origin_id"], row["recurrence_month"]) for row in all_rows(db,
         f"SELECT recurrence_origin_id,recurrence_month FROM {table} WHERE recurrence_origin_id = ANY(%s)",
         ([origin["id"] for origin in origins],))}
-    return missing_recurrences(origins, existing, as_of)
+    return missing_recurrences(origins, existing, as_of, months)
 
 
 def materialize_fixed_bills(db, as_of: date):
@@ -920,14 +921,18 @@ def state(who=Depends(user), db=Depends(db_session)):
         "monthly_totals": month_totals, "debt_series": debt_series, "users": users})
 
 
-def account_forecast(db, current: date, account_id: int | None) -> list[dict]:
+def spendable_balance(db, current: date, account_id: int | None = None) -> int:
     # Collateral accounts back a card limit and are not money available to spend.
-    balance = one(db, """SELECT COALESCE(SUM(a.opening_cents + COALESCE((SELECT SUM(CASE WHEN t.kind='income'
+    return one(db, """SELECT COALESCE(SUM(a.opening_cents + COALESCE((SELECT SUM(CASE WHEN t.kind='income'
         THEN t.amount_cents ELSE -t.amount_cents END) FROM transactions t WHERE t.account_id=a.id
         AND t.date<=%s AND t.movement_type<>'card_purchase'),0)),0)::bigint AS cents
         FROM accounts a WHERE (%s::bigint IS NULL OR a.id=%s)
         AND NOT EXISTS (SELECT 1 FROM credit_cards cc WHERE cc.collateral_account_id=a.id)""",
         (current, account_id, account_id))["cents"]
+
+
+def account_forecast(db, current: date, account_id: int | None) -> list[dict]:
+    balance = spendable_balance(db, current, account_id)
     bills = [item for item in bill_rows(db, current) if account_id is None or item["account_id"] == account_id]
     incomes = [item for item in income_rows(db, current) if account_id is None or item["account_id"] == account_id]
     return forecast_series(balance, bills, incomes, current)
@@ -1113,6 +1118,78 @@ def transactions_month(month: str | None = None, who=Depends(user), db=Depends(d
         "expense_count": len(expenses), "by_method": by_method,
         "by_category": sorted(({"category": key, "amount_cents": value} for key, value in by_category.items()),
             key=lambda item: -item["amount_cents"])})
+
+
+SIMULATION_MONTHS = 60
+
+
+def run_simulation(db, current: date) -> tuple[dict, dict]:
+    balance = spendable_balance(db, current)
+    bills = [item for item in bill_rows(db, current) if item["status"] != "paid"]
+    # Fixed bills and incomes exist in the table for 12 months; beyond that they are projected in memory.
+    for origin, due in recurrence_state(db, "bills", "expense_type", current, SIMULATION_MONTHS):
+        bills.append({**origin, "id": f"{origin['id']}-{due:%Y-%m}", "due_date": due, "payments": [],
+            "current_cents": origin["amount_cents"], "status": "pending"})
+    incomes = [{"due_date": item["due_date"], "amount_cents": item["remaining_cents"], "description": item["description"]}
+        for item in income_rows(db, current) if item["remaining_cents"] > 0]
+    incomes += [{"due_date": due, "amount_cents": origin["amount_cents"], "description": origin["description"]}
+        for origin, due in recurrence_state(db, "planned_incomes", "income_type", current, SIMULATION_MONTHS)]
+    result = simulate_payoff(balance, bills, incomes, current, SIMULATION_MONTHS)
+    month_end = add_months(current.replace(day=1), 1) - timedelta(days=1)
+    year_end = add_months(current.replace(day=1), 12) - timedelta(days=1)
+    overdue = [item for item in bills if item["due_date"] < current]
+    this_month = [item for item in bills if current <= item["due_date"] <= month_end]
+    need_today = sum(item["current_cents"] or 0 for item in overdue + this_month)
+    bills_year = sum(item["current_cents"] or 0 for item in bills if item["due_date"] <= year_end)
+    incomes_year = sum(item["amount_cents"] for item in incomes if item["due_date"] <= year_end)
+    year_gap = bills_year - incomes_year - balance
+    summary = {"generated_on": current, "balance_cents": balance,
+        "overdue_cents": sum(item["current_cents"] or 0 for item in overdue), "overdue_count": len(overdue),
+        "this_month_cents": sum(item["current_cents"] or 0 for item in this_month), "this_month_count": len(this_month),
+        "need_today_cents": need_today, "missing_today_cents": max(0, need_today - balance),
+        "payoff_date": result["payoff_date"], "months_to_payoff": result["months_to_payoff"],
+        "interest_cents": result["interest_cents"], "total_paid_cents": result["total_paid_cents"],
+        "unpaid_at_horizon_cents": result["unpaid_at_horizon_cents"], "horizon_months": SIMULATION_MONTHS,
+        "year_bills_cents": bills_year, "year_incomes_cents": incomes_year, "year_gap_cents": year_gap,
+        "monthly_extra_needed_cents": -(-max(0, year_gap) // 12)}
+    return summary, result
+
+
+def simulation_json(value: Any) -> str:
+    return json.dumps(value, default=json_default, ensure_ascii=False)
+
+
+@app.post("/api/simulations", status_code=201)
+def create_simulation(who=Depends(mutation), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    refresh_derived(db, current)
+    summary, result = run_simulation(db, current)
+    saved = one(db, """INSERT INTO simulations(user_id,summary,result) VALUES(%s,%s::jsonb,%s::jsonb)
+        RETURNING id,created_at""", (who["id"], simulation_json(summary), simulation_json(result)))
+    return json_response({"id": saved["id"], "created_at": saved["created_at"], "user_name": who["name"],
+        "summary": summary, "result": result}, 201)
+
+
+@app.get("/api/simulations")
+def list_simulations(who=Depends(user), db=Depends(db_session)):
+    return json_response(all_rows(db, """SELECT s.id,s.created_at,s.summary,u.name AS user_name FROM simulations s
+        LEFT JOIN users u ON u.id=s.user_id ORDER BY s.created_at DESC LIMIT 50"""))
+
+
+@app.get("/api/simulations/{simulation_id}")
+def get_simulation(simulation_id: int, who=Depends(user), db=Depends(db_session)):
+    row = one(db, """SELECT s.*,u.name AS user_name FROM simulations s LEFT JOIN users u ON u.id=s.user_id
+        WHERE s.id=%s""", (simulation_id,))
+    if not row:
+        fail(404, "Simulação não encontrada.")
+    return json_response(row)
+
+
+@app.delete("/api/simulations/{simulation_id}")
+def delete_simulation(simulation_id: int, who=Depends(mutation), db=Depends(db_session)):
+    if not one(db, "DELETE FROM simulations WHERE id=%s RETURNING id", (simulation_id,)):
+        fail(404, "Simulação não encontrada.")
+    return {"ok": True}
 
 
 @app.get("/api/accounts/{account_id}/details")
