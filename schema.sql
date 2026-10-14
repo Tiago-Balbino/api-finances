@@ -20,6 +20,16 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS yield_rates (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+  annual_basis_points INTEGER NOT NULL CHECK (annual_basis_points >= 0 AND annual_basis_points <= 10000)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS yield_rates_name_idx ON yield_rates(lower(name));
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_rate_id BIGINT REFERENCES yield_rates(id) ON DELETE RESTRICT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_multiplier_basis_points INTEGER NOT NULL DEFAULT 10000
+  CHECK (yield_multiplier_basis_points BETWEEN 0 AND 100000);
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yield_start_date DATE;
 CREATE TABLE IF NOT EXISTS categories (
   id BIGSERIAL PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('income', 'expense')),
@@ -70,6 +80,13 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bill_id BIGINT REFERENCES bill
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES categories(id) ON DELETE RESTRICT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS subcategory_id BIGINT REFERENCES subcategories(id) ON DELETE RESTRICT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS passive_yields (
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  date DATE NOT NULL,
+  amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
+  transaction_id BIGINT UNIQUE REFERENCES transactions(id) ON DELETE RESTRICT,
+  PRIMARY KEY (account_id, date)
+);
 CREATE TABLE IF NOT EXISTS investments (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL,
@@ -112,3 +129,5 @@ ALTER TABLE subcategories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bills ENABLE ROW LEVEL SECURITY;
 ALTER TABLE investments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE yield_rates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE passive_yields ENABLE ROW LEVEL SECURITY;

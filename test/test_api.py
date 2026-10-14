@@ -1,9 +1,11 @@
 import unittest
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from app.main import app, category_choice, materialize_fixed_bills, verify_password
+from app.main import (app, category_choice, daily_yield_cents, materialize_fixed_bills,
+                      monthly_payables, verify_password, yield_start)
 
 
 class FakeResult:
@@ -63,6 +65,20 @@ class ApiTests(unittest.TestCase):
         materialize_fixed_bills(db, date(2026, 2, 15))
         self.assertEqual(db.due_dates, [date(2026, 2, 28), date(2026, 3, 31),
             date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31)])
+
+    def test_unpaid_expense_carries_into_each_next_month(self):
+        bill = {"id": 1, "amount_cents": 10000, "due_date": date(2026, 9, 10),
+                "interest_rate_basis_points": 0, "interest_period": "monthly",
+                "status": "overdue", "payments": []}
+        series = monthly_payables([bill], date(2026, 10, 14))
+        self.assertEqual([point["value_cents"] for point in series], [10000] * 6)
+        self.assertTrue(all(point["items"][0]["carried"] for point in series))
+
+    def test_passive_yield_uses_effective_annual_rate_and_starts_at_eight(self):
+        self.assertEqual(daily_yield_cents(1000000, 1000, 10500), 396)
+        zone = ZoneInfo("America/Sao_Paulo")
+        self.assertEqual(yield_start(datetime(2026, 10, 14, 7, 59, tzinfo=zone)), date(2026, 10, 14))
+        self.assertEqual(yield_start(datetime(2026, 10, 14, 8, 0, tzinfo=zone)), date(2026, 10, 15))
 
 
 if __name__ == "__main__":

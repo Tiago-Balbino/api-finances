@@ -1,7 +1,7 @@
 import unittest
 from datetime import date
 
-from app.finance import add_months, bill_status, debt_cents_at, projected_cents
+from app.finance import add_months, bill_status, debt_cents_at, is_business_day, projected_cents
 
 
 class FinanceTests(unittest.TestCase):
@@ -22,6 +22,14 @@ class FinanceTests(unittest.TestCase):
 
     def test_month_end(self):
         self.assertEqual(add_months(date(2026, 1, 31), 1), date(2026, 2, 28))
+
+    def test_brazilian_banking_holidays(self):
+        self.assertFalse(is_business_day(date(2026, 2, 16)))  # Carnaval
+        self.assertFalse(is_business_day(date(2026, 2, 17)))
+        self.assertFalse(is_business_day(date(2026, 4, 3)))   # Sexta-Feira Santa
+        self.assertFalse(is_business_day(date(2026, 6, 4)))   # Corpus Christi
+        self.assertFalse(is_business_day(date(2026, 11, 20)))
+        self.assertTrue(is_business_day(date(2026, 10, 14)))
 
 
 if __name__ == "__main__":

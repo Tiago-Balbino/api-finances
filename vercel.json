@@ -1,0 +1,5 @@
+{
+  "crons": [
+    { "path": "/api/cron/passive-yields", "schedule": "0 11 * * 1-5" }
+  ]
+}

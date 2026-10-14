@@ -5,10 +5,12 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, time as clock_time, timedelta
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -17,7 +19,7 @@ from fastapi.responses import JSONResponse
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from psycopg.rows import dict_row
 
-from .finance import add_months, bill_status, debt_cents_at, projected_cents, today
+from .finance import add_months, bill_status, debt_cents_at, is_business_day, projected_cents, today
 
 
 def connect():
@@ -229,6 +231,79 @@ def materialize_fixed_bills(db, as_of: date):
                  origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], month))
 
 
+YIELD_ZONE = ZoneInfo("America/Sao_Paulo")
+
+
+def yield_clock() -> datetime:
+    return datetime.now(YIELD_ZONE)
+
+
+def yield_start(now: datetime) -> date:
+    return now.date() + timedelta(days=1 if now.time() >= clock_time(8) else 0)
+
+
+def daily_yield_cents(balance_cents: int, annual_basis_points: int, multiplier_basis_points: int) -> int:
+    # Convert the effective annual rate to one of 252 business-day periods.
+    if balance_cents <= 0 or annual_basis_points <= 0 or multiplier_basis_points <= 0:
+        return 0
+    with localcontext() as context:
+        context.prec = 32
+        annual = Decimal(annual_basis_points) * Decimal(multiplier_basis_points) / Decimal(100000000)
+        daily = (Decimal(1) + annual) ** (Decimal(1) / Decimal(252)) - Decimal(1)
+        return int((Decimal(balance_cents) * daily).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def accrue_passive_yields(db, now: datetime | None = None) -> int:
+    now = now or yield_clock()
+    cutoff = now.date() if now.time() >= clock_time(8) else now.date() - timedelta(days=1)
+    accounts = all_rows(db, """SELECT a.*,r.name AS rate_name,r.annual_basis_points
+        FROM accounts a JOIN yield_rates r ON r.id=a.yield_rate_id
+        WHERE a.yield_start_date IS NOT NULL AND a.yield_start_date <= %s
+        ORDER BY a.id FOR UPDATE OF a""", (cutoff,))
+    category = one(db, "SELECT id FROM categories WHERE kind='income' AND name='Investimentos'")
+    created = 0
+    for account in accounts:
+        last = one(db, "SELECT max(date) AS last FROM passive_yields WHERE account_id=%s", (account["id"],))["last"]
+        current = max(account["yield_start_date"], last + timedelta(days=1)) if last else account["yield_start_date"]
+        while current <= cutoff:
+            if is_business_day(current):
+                at_eight = datetime.combine(current, clock_time(8), tzinfo=YIELD_ZONE)
+                balance = one(db, """SELECT a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income'
+                    THEN t.amount_cents ELSE -t.amount_cents END),0) AS cents
+                    FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id
+                    AND (t.date < %s OR (t.date = %s AND t.created_at <= %s))
+                    WHERE a.id=%s GROUP BY a.id""", (current, current, at_eight, account["id"]))["cents"]
+                amount = daily_yield_cents(balance, account["annual_basis_points"],
+                    account["yield_multiplier_basis_points"])
+                transaction_id = None
+                if amount:
+                    result = one(db, """INSERT INTO transactions(account_id,kind,description,category,category_id,
+                        note,amount_cents,date) VALUES(%s,'income',%s,'Investimentos',%s,%s,%s,%s) RETURNING id""",
+                        (account["id"], f"Rendimento: {account['name']}", category["id"] if category else None,
+                         f"{account['yield_multiplier_basis_points'] / 100:g}% de {account['rate_name']}"
+                         f" ({account['annual_basis_points'] / 100:g}% a.a.)", amount, current))
+                    transaction_id = result["id"]
+                    created += 1
+                db.execute("INSERT INTO passive_yields(account_id,date,amount_cents,transaction_id) VALUES(%s,%s,%s,%s)",
+                    (account["id"], current, amount, transaction_id))
+            current += timedelta(days=1)
+    return created
+
+
+def monthly_payables(bills: list[dict], current: date) -> list[dict]:
+    series = []
+    for i in range(6):
+        month_start = add_months(current.replace(day=1), i)
+        month_end = add_months(month_start, 1) - timedelta(days=1)
+        projection_date = current if i == 0 else month_end
+        items = [{"id": b["id"], "value_cents": debt_cents_at(b, b["payments"], max(projection_date, b["due_date"])),
+            "carried": b["due_date"] < month_start} for b in bills
+            if b["status"] != "paid" and b["due_date"] <= month_end]
+        series.append({"date": month_start, "value_cents": sum(item["value_cents"] or 0 for item in items),
+            "items": items})
+    return series
+
+
 @app.get("/health")
 def health(db=Depends(db_session)):
     one(db, "SELECT 1")
@@ -296,11 +371,16 @@ def change_password(value: dict, who=Depends(mutation), db=Depends(db_session)):
 def state(who=Depends(user), db=Depends(db_session)):
     current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
     materialize_fixed_bills(db, current)
-    accounts = all_rows(db, """SELECT a.*, a.opening_cents + COALESCE(SUM(CASE WHEN t.date>%s THEN 0
+    accrue_passive_yields(db)
+    accounts = all_rows(db, """SELECT a.*,r.name AS yield_rate_name,r.annual_basis_points AS yield_annual_basis_points,
+        a.opening_cents + COALESCE(SUM(CASE WHEN t.date>%s THEN 0
         WHEN t.kind='income' THEN t.amount_cents ELSE -t.amount_cents END),0) AS balance_cents
-        FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id GROUP BY a.id ORDER BY a.id DESC""", (current,))
-    transactions = all_rows(db, """SELECT t.*,a.name AS account_name,COALESCE(c.name,t.category) AS category_name,
+        FROM accounts a LEFT JOIN yield_rates r ON r.id=a.yield_rate_id
+        LEFT JOIN transactions t ON t.account_id=a.id GROUP BY a.id,r.id ORDER BY a.id DESC""", (current,))
+    transactions = all_rows(db, """SELECT t.*,py.transaction_id IS NOT NULL AS automatic_yield,
+        a.name AS account_name,COALESCE(c.name,t.category) AS category_name,
         s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id=t.account_id
+        LEFT JOIN passive_yields py ON py.transaction_id=t.id
         LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN subcategories s ON s.id=t.subcategory_id
         ORDER BY t.date DESC,t.id DESC LIMIT 500""")
     for transaction in transactions:
@@ -311,6 +391,7 @@ def state(who=Depends(user), db=Depends(db_session)):
         investment["future_cents"] = projected_cents(investment["principal_cents"], investment["rate_basis_points"], investment["start_date"], add_months(current, 12), investment["period"])
     bills = bill_rows(db, current)
     categories = all_rows(db, "SELECT id,kind,name FROM categories ORDER BY kind,name")
+    yield_rates = all_rows(db, "SELECT id,name,annual_basis_points FROM yield_rates ORDER BY name")
     subcategories = all_rows(db, "SELECT id,category_id,name FROM subcategories ORDER BY name")
     month_start = current.replace(day=1)
     month_end = add_months(month_start, 1)
@@ -327,16 +408,22 @@ def state(who=Depends(user), db=Depends(db_session)):
         GROUP BY t.category_id,COALESCE(c.name,t.category),t.subcategory_id,s.name ORDER BY amount_cents DESC""", (month_start, month_end, current))
     investment_series = [{"date": add_months(current, i), "value_cents": sum(projected_cents(x["principal_cents"], x["rate_basis_points"], x["start_date"], add_months(current, i), x["period"]) or 0 for x in investments)} for i in range(13)]
     debt_series = [{"date": add_months(current, i), "value_cents": sum(debt_cents_at(x, x["payments"], add_months(current, i)) or 0 for x in bills)} for i in range(13)]
-    due_series = []
-    for i in range(6):
-        month = add_months(current, i).strftime("%Y-%m")
-        relevant = (b for b in bills if b["status"] != "paid" and (b["due_date"].strftime("%Y-%m") <= month if i == 0 else b["due_date"].strftime("%Y-%m") == month))
-        due_series.append({"date": add_months(current, i), "value_cents": sum(debt_cents_at(b, b["payments"], max(current, b["due_date"])) or 0 for b in relevant)})
+    due_series = monthly_payables(bills, current)
     users = all_rows(db, "SELECT id,name,email,role,active FROM users ORDER BY id") if who["role"] == "admin" else []
     return jsonable_encoder({"user": who, "today": current, "accounts": accounts, "transactions": transactions,
         "investments": investments, "bills": bills, "categories": categories, "subcategories": subcategories,
+        "yield_rates": yield_rates,
         "monthly_spending": spending, "monthly_totals": month_totals, "investment_series": investment_series,
         "debt_series": debt_series, "due_series": due_series, "users": users})
+
+
+@app.get("/api/cron/passive-yields")
+def scheduled_passive_yields(request: Request, db=Depends(db_session)):
+    secret = os.getenv("CRON_SECRET", "")
+    authorization = request.headers.get("authorization", "")
+    if not secret or not hmac.compare_digest(authorization, f"Bearer {secret}"):
+        fail(401, "Cron não autorizado.")
+    return {"created": accrue_passive_yields(db)}
 
 
 @app.post("/api/categories", status_code=201)
@@ -388,25 +475,73 @@ def delete_subcategory(subcategory_id: int, who=Depends(mutation), db=Depends(db
 
 @app.post("/api/accounts", status_code=201)
 def create_account(value: dict, who=Depends(mutation), db=Depends(db_session)):
-    result = one(db, "INSERT INTO accounts(name,type,opening_cents,note) VALUES(%s,%s,%s,%s) RETURNING id",
-        (text(value.get("name"), "Nome da conta"), text(value.get("type"), "Tipo", 60), integer(value.get("openingCents"), "Saldo inicial", 0), note(value.get("note"))))
+    rate_id, multiplier = account_yield_choice(db, value)
+    result = one(db, """INSERT INTO accounts(name,type,opening_cents,note,yield_rate_id,
+        yield_multiplier_basis_points,yield_start_date) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (text(value.get("name"), "Nome da conta"), text(value.get("type"), "Tipo", 60),
+         integer(value.get("openingCents"), "Saldo inicial", 0), note(value.get("note")),
+         rate_id, multiplier, yield_start(yield_clock()) if rate_id else None))
     return {"id": result["id"]}
 
 
 @app.patch("/api/accounts/{account_id}")
 def edit_account(account_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
-    if not one(db, "UPDATE accounts SET name=%s,type=%s,opening_cents=%s,note=%s WHERE id=%s RETURNING id",
-        (text(value.get("name"), "Nome da conta"), text(value.get("type"), "Tipo", 60), integer(value.get("openingCents"), "Saldo inicial", 0), note(value.get("note")), account_id)):
+    accrue_passive_yields(db)
+    existing = one(db, "SELECT * FROM accounts WHERE id=%s FOR UPDATE", (account_id,))
+    if not existing:
         fail(404, "Conta não encontrada.")
+    rate_id, multiplier = account_yield_choice(db, value)
+    changed = rate_id != existing["yield_rate_id"] or multiplier != existing["yield_multiplier_basis_points"]
+    start = yield_start(yield_clock()) if rate_id and changed else existing["yield_start_date"] if rate_id else None
+    db.execute("""UPDATE accounts SET name=%s,type=%s,opening_cents=%s,note=%s,yield_rate_id=%s,
+        yield_multiplier_basis_points=%s,yield_start_date=%s WHERE id=%s""",
+        (text(value.get("name"), "Nome da conta"), text(value.get("type"), "Tipo", 60),
+         integer(value.get("openingCents"), "Saldo inicial", 0), note(value.get("note")),
+         rate_id, multiplier, start, account_id))
     return {"ok": True}
 
 
 @app.delete("/api/accounts/{account_id}")
 def delete_account(account_id: int, who=Depends(mutation), db=Depends(db_session)):
-    if one(db, "SELECT id FROM transactions WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM bills WHERE account_id=%s LIMIT 1", (account_id,)):
+    if one(db, "SELECT id FROM transactions WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM bills WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT 1 FROM passive_yields WHERE account_id=%s LIMIT 1", (account_id,)):
         fail(409, "Esta conta possui despesas ou lançamentos.")
     if not one(db, "DELETE FROM accounts WHERE id=%s RETURNING id", (account_id,)):
         fail(404, "Conta não encontrada.")
+    return {"ok": True}
+
+
+def account_yield_choice(db, value: dict):
+    rate_id = value.get("yieldRateId") or None
+    multiplier = integer(value.get("yieldMultiplierBasisPoints", 10000), "Percentual da taxa", 0, 100000)
+    if rate_id is not None:
+        rate_id = integer(rate_id, "Taxa de referência")
+        if not one(db, "SELECT id FROM yield_rates WHERE id=%s", (rate_id,)):
+            fail(400, "Taxa de referência inválida.")
+    return rate_id, multiplier
+
+
+@app.post("/api/yield-rates", status_code=201)
+def create_yield_rate(value: dict, who=Depends(mutation), db=Depends(db_session)):
+    result = one(db, "INSERT INTO yield_rates(name,annual_basis_points) VALUES(%s,%s) RETURNING id",
+        (text(value.get("name"), "Nome da taxa", 80), integer(value.get("annualBasisPoints"), "Taxa anual", 0, 10000)))
+    return {"id": result["id"]}
+
+
+@app.patch("/api/yield-rates/{rate_id}")
+def edit_yield_rate(rate_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    accrue_passive_yields(db)
+    if not one(db, "UPDATE yield_rates SET name=%s,annual_basis_points=%s WHERE id=%s RETURNING id",
+        (text(value.get("name"), "Nome da taxa", 80), integer(value.get("annualBasisPoints"), "Taxa anual", 0, 10000), rate_id)):
+        fail(404, "Taxa não encontrada.")
+    return {"ok": True}
+
+
+@app.delete("/api/yield-rates/{rate_id}")
+def delete_yield_rate(rate_id: int, who=Depends(mutation), db=Depends(db_session)):
+    if one(db, "SELECT id FROM accounts WHERE yield_rate_id=%s LIMIT 1", (rate_id,)):
+        fail(409, "Esta taxa está em uso por uma conta.")
+    if not one(db, "DELETE FROM yield_rates WHERE id=%s RETURNING id", (rate_id,)):
+        fail(404, "Taxa não encontrada.")
     return {"ok": True}
 
 
@@ -591,6 +726,8 @@ def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db
         fail(404, "Lançamento não encontrado.")
     if existing["bill_id"]:
         fail(409, "Edite o pagamento na despesa correspondente.")
+    if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
+        fail(409, "Rendimentos automáticos não podem ser editados.")
     account_id = integer(value.get("accountId"), "Conta")
     if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
         fail(400, "Conta inválida.")
@@ -610,6 +747,8 @@ def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db
 def delete_transaction(transaction_id: int, who=Depends(mutation), db=Depends(db_session)):
     if one(db, "SELECT id FROM transactions WHERE id=%s AND bill_id IS NOT NULL", (transaction_id,)):
         fail(409, "Exclua o pagamento na despesa correspondente.")
+    if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
+        fail(409, "Rendimentos automáticos não podem ser excluídos.")
     if not one(db, "DELETE FROM transactions WHERE id=%s RETURNING id", (transaction_id,)):
         fail(404, "Lançamento não encontrado.")
     return {"ok": True}

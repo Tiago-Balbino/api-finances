@@ -1,5 +1,6 @@
 from calendar import monthrange
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from functools import lru_cache
 from math import floor, isfinite
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,29 @@ def add_months(value: date, count: int) -> date:
     year = value.year + month // 12
     month = month % 12 + 1
     return date(year, month, min(value.day, monthrange(year, month)[1]))
+
+
+@lru_cache(maxsize=32)
+def banking_holidays(year: int) -> frozenset[date]:
+    """Brazilian national banking holidays, including movable dates."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f, g = (b + 8) // 25, (b - (b + 8) // 25 + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    value = h + l - 7 * m + 114
+    easter = date(year, value // 31, value % 31 + 1)
+    fixed = {(1, 1), (4, 21), (5, 1), (9, 7), (10, 12),
+             (11, 2), (11, 15), (11, 20), (12, 25)}
+    return frozenset({date(year, month, day) for month, day in fixed} |
+                     {easter - timedelta(days=48), easter - timedelta(days=47),
+                      easter - timedelta(days=2), easter + timedelta(days=60)})
+
+
+def is_business_day(value: date) -> bool:
+    return value.weekday() < 5 and value not in banking_holidays(value.year)
 
 
 def periods(start: date, end: date, period: str) -> float:
