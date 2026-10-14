@@ -1,8 +1,8 @@
 import unittest
 from datetime import date
 
-from app.finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, projected_cents,
-                         simulate_payoff, split_installments)
+from app.finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, payments_fit,
+                         projected_cents, simulate_payoff, split_installments)
 
 
 class FinanceTests(unittest.TestCase):
@@ -103,6 +103,15 @@ class FinanceTests(unittest.TestCase):
         result = simulate_payoff(0, bills, incomes, today, months=12)
         self.assertEqual(result["months_to_payoff"], 0)
         self.assertEqual(result["interest_cents"], 0)
+
+    def test_payments_fit_checks_each_payment_against_the_balance_of_its_day(self):
+        bill = {"amount_cents": 10000, "due_date": date(2026, 10, 10), "interest_rate_basis_points": 0,
+                "interest_period": "monthly"}
+        early = {"id": 1, "date": date(2026, 10, 1), "amount_cents": 4000}
+        later = {"id": 2, "date": date(2026, 10, 5), "amount_cents": 6000}
+        self.assertTrue(payments_fit(bill, [later, early]))  # dates out of order are fine
+        self.assertFalse(payments_fit(bill, [early, {**later, "amount_cents": 6001}]))
+        self.assertFalse(payments_fit({**bill, "amount_cents": 5000}, [early, later]))  # invoice reduced below what was paid
 
 
 if __name__ == "__main__":

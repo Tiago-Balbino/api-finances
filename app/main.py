@@ -23,8 +23,8 @@ from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from .finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, projected_cents,
-                      simulate_payoff, split_installments, today)
+from .finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, payments_fit,
+                      projected_cents, simulate_payoff, split_installments, today)
 
 
 def database_url() -> str:
@@ -270,7 +270,7 @@ def bill_rows(db, as_of: date):
         LEFT JOIN categories c ON c.id=b.category_id LEFT JOIN subcategories s ON s.id=b.subcategory_id
         WHERE b.archived=FALSE ORDER BY b.due_date,b.id""")
     payments = all_rows(db, """SELECT t.id,t.bill_id,t.account_id,t.amount_cents,t.date,t.note,t.payment_method,
-        t.card_purchase_id,cp.installments,cc.name AS card_name,a.name AS account_name
+        t.card_purchase_id,t.credit_card_id,cp.installments,cc.name AS card_name,a.name AS account_name
         FROM transactions t JOIN accounts a ON a.id=t.account_id
         LEFT JOIN card_purchases cp ON cp.id=t.card_purchase_id LEFT JOIN credit_cards cc ON cc.id=t.credit_card_id
         WHERE t.bill_id IS NOT NULL ORDER BY t.date,t.id""")
@@ -801,17 +801,35 @@ def create_card_purchase(db, card: dict, description: str, category: tuple, purc
     return purchase_id
 
 
-def remove_card_purchase(db, purchase_id: int):
+def check_invoices(db, invoice_ids: list[int]):
+    """A cancelled or edited purchase cannot leave an invoice with more paid than it now owes."""
+    for invoice in all_rows(db, "SELECT * FROM bills WHERE id = ANY(%s)", (list(invoice_ids),)):
+        payments = all_rows(db, "SELECT id,amount_cents,date FROM transactions WHERE bill_id=%s", (invoice["id"],))
+        total = one(db, "SELECT COALESCE(SUM(amount_cents),0)::bigint AS cents FROM transactions WHERE invoice_bill_id=%s",
+            (invoice["id"],))["cents"]
+        if payments and (not total or not payments_fit({**invoice, "amount_cents": total}, payments)):
+            fail(409, f"A {invoice['description']} já foi paga e ficaria com pagamento a mais. "
+                "Exclua ou ajuste o pagamento dessa fatura em Despesas antes.")
+
+
+def remove_card_purchase(db, purchase_id: int, check: bool = True) -> list[int]:
     rows = all_rows(db, "SELECT id,invoice_bill_id FROM transactions WHERE card_purchase_id=%s FOR UPDATE", (purchase_id,))
     if not rows:
         fail(404, "Compra não encontrada.")
     invoices = sorted({row["invoice_bill_id"] for row in rows})
-    if one(db, "SELECT id FROM transactions WHERE bill_id = ANY(%s) LIMIT 1", (invoices,)):
-        fail(409, "Esta compra está em uma fatura com pagamento. Exclua os pagamentos da fatura primeiro.")
     db.execute("DELETE FROM transactions WHERE card_purchase_id=%s", (purchase_id,))
     db.execute("DELETE FROM card_purchases WHERE id=%s", (purchase_id,))
+    if check:
+        check_invoices(db, invoices)
     for invoice_id in invoices:
         refresh_invoice(db, invoice_id)
+    return invoices
+
+
+def purchase_invoices(db, purchase_id: int) -> list[int]:
+    return [row["invoice_bill_id"] for row in all_rows(db,
+        "SELECT DISTINCT invoice_bill_id FROM transactions WHERE card_purchase_id=%s", (purchase_id,))]
+
 
 
 @app.get("/health")
@@ -907,13 +925,13 @@ def state(who=Depends(user), db=Depends(db_session)):
     debt_series = [{"date": add_months(current, i), "value_cents": sum(debt_cents_at(x, x["payments"], add_months(current, i)) or 0 for x in bills)} for i in range(13)]
     users = all_rows(db, "SELECT id,name,email,role,active FROM users ORDER BY id") if who["role"] == "admin" else []
     credit_cards = card_rows(db, current)
-    card_purchases = all_rows(db, """SELECT p.*,cc.name AS card_name,
-        MIN(t.category) AS category,MIN(t.category_id) AS category_id,MIN(t.subcategory_id) AS subcategory_id,
+    card_purchases = all_rows(db, """SELECT p.*,cc.name AS card_name,cc.payment_account_id AS account_id,
+        MIN(t.id) AS transaction_id,MIN(t.category) AS category,MIN(t.category_id) AS category_id,MIN(t.subcategory_id) AS subcategory_id,
         MIN(t.note) AS note,MIN(t.bill_id) AS bill_id,
         COALESCE(SUM(t.amount_cents) FILTER (WHERE b.due_date > %s),0)::bigint AS remaining_cents
         FROM card_purchases p JOIN credit_cards cc ON cc.id=p.credit_card_id
         JOIN transactions t ON t.card_purchase_id=p.id JOIN bills b ON b.id=t.invoice_bill_id
-        GROUP BY p.id,cc.name ORDER BY p.purchase_date DESC,p.id DESC LIMIT 300""", (current,))
+        GROUP BY p.id,cc.name,cc.payment_account_id ORDER BY p.purchase_date DESC,p.id DESC LIMIT 300""", (current,))
     # Month pages load their own summaries (/api/*/month); this payload only carries shared records.
     return json_response({"user": who, "today": current, "accounts": accounts,
         "credit_cards": credit_cards, "card_purchases": card_purchases, "bills": bills, "incomes": incomes,
@@ -1516,8 +1534,7 @@ def stop_income_recurrence(income_id: int, who=Depends(mutation), db=Depends(db_
     return {"ok": True}
 
 
-@app.post("/api/incomes/{income_id}/receipts", status_code=201)
-def receive_income(income_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+def register_receipt(db, income_id: int, value: dict, replacing: int | None = None) -> int:
     when = parsed_date(value.get("date"))
     if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
         fail(400, "Registre o recebimento na data em que ele acontecer.")
@@ -1528,15 +1545,31 @@ def receive_income(income_id: int, value: dict, who=Depends(mutation), db=Depend
         fail(404, "Entrada não encontrada.")
     if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
         fail(400, "Conta inválida.")
-    received = one(db, "SELECT COALESCE(SUM(amount_cents),0) AS cents FROM transactions WHERE planned_income_id=%s", (income_id,))["cents"]
+    received = one(db, """SELECT COALESCE(SUM(amount_cents),0) AS cents FROM transactions
+        WHERE planned_income_id=%s AND id IS DISTINCT FROM %s""", (income_id, replacing))["cents"]
     if amount > income["amount_cents"] - received:
         fail(400, "Recebimento acima do valor restante.")
-    result = one(db, """INSERT INTO transactions(account_id,planned_income_id,kind,description,category,
+    if replacing:
+        db.execute("""UPDATE transactions SET account_id=%s,note=%s,amount_cents=%s,date=%s WHERE id=%s""",
+            (account_id, note(value.get("note")), amount, when, replacing))
+        return replacing
+    return one(db, """INSERT INTO transactions(account_id,planned_income_id,kind,description,category,
         category_id,subcategory_id,note,amount_cents,date)
         VALUES(%s,%s,'income',%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (account_id, income_id, f"Recebimento: {income['description']}", income["category"],
-         income["category_id"], income["subcategory_id"], note(value.get("note")), amount, when))
-    return {"id": result["id"]}
+         income["category_id"], income["subcategory_id"], note(value.get("note")), amount, when))["id"]
+
+
+@app.post("/api/incomes/{income_id}/receipts", status_code=201)
+def receive_income(income_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    return {"id": register_receipt(db, income_id, value)}
+
+
+@app.patch("/api/incomes/{income_id}/receipts/{receipt_id}")
+def edit_income_receipt(income_id: int, receipt_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    if not one(db, "SELECT id FROM transactions WHERE planned_income_id=%s AND id=%s", (income_id, receipt_id)):
+        fail(404, "Recebimento não encontrado.")
+    return {"id": register_receipt(db, income_id, value, receipt_id)}
 
 
 @app.delete("/api/incomes/{income_id}/receipts/{receipt_id}")
@@ -1667,8 +1700,8 @@ def edit_bill_interest(bill_id: int, value: dict, who=Depends(mutation), db=Depe
     return {"ok": True}
 
 
-@app.post("/api/bills/{bill_id}/payments", status_code=201)
-def pay_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+def register_bill_payment(db, bill_id: int, value: dict, replacing: dict | None = None) -> int:
+    """Create a bill payment, or replace an existing one, validating it against the balance of its day."""
     when = parsed_date(value.get("date"))
     if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
         fail(400, "Registre o pagamento na data em que ele acontecer.")
@@ -1682,30 +1715,43 @@ def pay_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_ses
         fail(400, "Conta inválida.")
     if bill["credit_card_id"] and method == "credit":
         fail(400, "Pague a fatura com Pix ou débito.")
-    payments = all_rows(db, "SELECT id,amount_cents,date FROM transactions WHERE bill_id=%s ORDER BY date,id", (bill_id,))
-    if payments and when < payments[-1]["date"]:
-        fail(400, "A data deve ser igual ou posterior ao último pagamento.")
-    outstanding = debt_cents_at(bill, payments, when)
-    if outstanding is None:
-        fail(400, "A projeção excedeu o limite de cálculo.")
-    if outstanding == 0:
-        fail(409, "Esta despesa já está paga.")
-    if amount > outstanding:
-        fail(400, "Pagamento acima do saldo devido.")
+    old_invoices = []
+    if replacing:
+        if replacing["card_purchase_id"]:
+            old_invoices = remove_card_purchase(db, replacing["card_purchase_id"], check=False)
+        else:
+            db.execute("DELETE FROM transactions WHERE id=%s", (replacing["id"],))
+    payments = all_rows(db, "SELECT id,amount_cents,date FROM transactions WHERE bill_id=%s", (bill_id,))
+    if not payments_fit(bill, payments + [{"id": 10**15, "date": when, "amount_cents": amount}]):
+        fail(400, "Pagamento acima do saldo devido nessa data.")
     if method == "credit":
         card = card_for_account(db, value.get("creditCardId"), account_id)
         installments = integer(value.get("installments", 1), "Parcelas", 1, 48)
         purchase_id = create_card_purchase(db, card, f"Pagamento: {bill['description']}",
             (bill["category"], bill["category_id"], bill["subcategory_id"]), note(value.get("note")),
             amount, when, installments, bill_id)
-        return {"id": purchase_id}
-    result = one(db, """INSERT INTO transactions(account_id,bill_id,kind,description,category,category_id,
+        check_invoices(db, old_invoices)
+        return purchase_id
+    check_invoices(db, old_invoices)
+    return one(db, """INSERT INTO transactions(account_id,bill_id,kind,description,category,category_id,
         subcategory_id,note,amount_cents,date,payment_method,movement_type)
         VALUES(%s,%s,'expense',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (account_id, bill_id, f"Pagamento: {bill['description']}", bill["category"], bill["category_id"],
          bill["subcategory_id"], note(value.get("note")), amount, when, method,
-         "invoice_payment" if bill["credit_card_id"] else "regular"))
-    return {"id": result["id"]}
+         "invoice_payment" if bill["credit_card_id"] else "regular"))["id"]
+
+
+@app.post("/api/bills/{bill_id}/payments", status_code=201)
+def pay_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    return {"id": register_bill_payment(db, bill_id, value)}
+
+
+@app.patch("/api/bills/{bill_id}/payments/{payment_id}")
+def edit_payment(bill_id: int, payment_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    payment = one(db, "SELECT id,card_purchase_id FROM transactions WHERE bill_id=%s AND id=%s", (bill_id, payment_id))
+    if not payment:
+        fail(404, "Pagamento não encontrado.")
+    return {"id": register_bill_payment(db, bill_id, value, payment)}
 
 
 @app.delete("/api/bills/{bill_id}/payments/{payment_id}")
@@ -1724,8 +1770,8 @@ def expense_method(value: dict, transaction_kind: str) -> str | None:
     return payment_method(value.get("paymentMethod", "pix")) if transaction_kind == "expense" else None
 
 
-@app.post("/api/transactions", status_code=201)
-def create_transaction(value: dict, who=Depends(mutation), db=Depends(db_session)):
+def save_transaction(db, value: dict, existing: dict | None = None) -> int:
+    """Create or replace a day-to-day entry. A credit purchase becomes installments in the card invoices."""
     account_id = integer(value.get("accountId"), "Conta")
     if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
         fail(400, "Conta inválida.")
@@ -1737,61 +1783,52 @@ def create_transaction(value: dict, who=Depends(mutation), db=Depends(db_session
         fail(400, "Lançamentos imediatos não podem ter data futura. Use Despesas para contas a vencer.")
     description = text(value.get("description"), "Nome do lançamento")
     amount = integer(value.get("amountCents"), "Valor")
+    entry_note = note(value.get("note"))
+    if existing and not existing["card_purchase_id"] and method != "credit":
+        db.execute("""UPDATE transactions SET account_id=%s,kind=%s,description=%s,category=%s,category_id=%s,
+            subcategory_id=%s,note=%s,amount_cents=%s,date=%s,payment_method=%s WHERE id=%s""",
+            (account_id, transaction_kind, description, category_name, category_id, subcategory_id, entry_note,
+             amount, when, method, existing["id"]))
+        return existing["id"]
+    old_invoices = []
+    if existing:
+        if existing["card_purchase_id"]:
+            old_invoices = remove_card_purchase(db, existing["card_purchase_id"], check=False)
+        else:
+            db.execute("DELETE FROM transactions WHERE id=%s", (existing["id"],))
     if method == "credit":
         card = card_for_account(db, value.get("creditCardId"), account_id)
         installments = integer(value.get("installments", 1), "Parcelas", 1, 48)
-        return {"id": create_card_purchase(db, card, description, (category_name, category_id, subcategory_id),
-            note(value.get("note")), amount, when, installments)}
-    result = one(db, """INSERT INTO transactions(account_id,kind,description,category,category_id,
-        subcategory_id,note,amount_cents,date,payment_method) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-        (account_id, transaction_kind, description, category_name, category_id, subcategory_id,
-         note(value.get("note")), amount, when, method))
-    return {"id": result["id"]}
+        created = create_card_purchase(db, card, description, (category_name, category_id, subcategory_id),
+            entry_note, amount, when, installments)
+    else:
+        created = one(db, """INSERT INTO transactions(account_id,kind,description,category,category_id,
+            subcategory_id,note,amount_cents,date,payment_method) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (account_id, transaction_kind, description, category_name, category_id, subcategory_id, entry_note,
+             amount, when, method))["id"]
+    check_invoices(db, old_invoices)
+    return created
+
+
+@app.post("/api/transactions", status_code=201)
+def create_transaction(value: dict, who=Depends(mutation), db=Depends(db_session)):
+    return {"id": save_transaction(db, value)}
 
 
 @app.patch("/api/transactions/{transaction_id}")
 def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
-    existing = one(db, "SELECT kind,bill_id,planned_income_id,movement_type,card_purchase_id FROM transactions WHERE id=%s",
-        (transaction_id,))
+    existing = one(db, "SELECT * FROM transactions WHERE id=%s", (transaction_id,))
     if not existing:
         fail(404, "Lançamento não encontrado.")
     if existing["bill_id"]:
         fail(409, "Edite o pagamento na despesa correspondente.")
     if existing["planned_income_id"]:
-        fail(409, "Exclua o recebimento na entrada correspondente.")
+        fail(409, "Edite o recebimento na entrada correspondente.")
     if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
         fail(409, "Rendimentos automáticos não podem ser editados.")
     if existing["movement_type"] == "transfer":
         fail(409, "Exclua o aporte ou resgate e registre novamente.")
-    if existing["card_purchase_id"]:
-        # Amount, date and card define the invoices; only the description and classification change here.
-        category_id, subcategory_id, category_name = category_choice(db, value, "expense")
-        description = text(value.get("description"), "Nome do lançamento")
-        purchase = one(db, "UPDATE card_purchases SET description=%s WHERE id=%s RETURNING installments",
-            (description, existing["card_purchase_id"]))
-        db.execute("""UPDATE transactions SET description=CASE WHEN %s > 1
-            THEN %s || ' (' || installment_number || '/' || %s || ')' ELSE %s END,
-            category=%s,category_id=%s,subcategory_id=%s,note=%s WHERE card_purchase_id=%s""",
-            (purchase["installments"], description, purchase["installments"], description, category_name,
-             category_id, subcategory_id, note(value.get("note")), existing["card_purchase_id"]))
-        return {"ok": True}
-    account_id = integer(value.get("accountId"), "Conta")
-    if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
-        fail(400, "Conta inválida.")
-    transaction_kind = kind(value.get("kind"))
-    method = expense_method(value, transaction_kind)
-    if method == "credit":
-        fail(400, "Para lançar no crédito, exclua este lançamento e registre a compra no cartão.")
-    category_id, subcategory_id, category_name = category_choice(db, value, transaction_kind)
-    when = parsed_date(value.get("date"))
-    if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
-        fail(400, "Lançamentos imediatos não podem ter data futura.")
-    db.execute("""UPDATE transactions SET account_id=%s,kind=%s,description=%s,category=%s,
-        category_id=%s,subcategory_id=%s,note=%s,amount_cents=%s,date=%s,payment_method=%s WHERE id=%s""",
-        (account_id, transaction_kind, text(value.get("description"), "Nome do lançamento"), category_name,
-        category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"), when,
-        method, transaction_id))
-    return {"ok": True}
+    return {"id": save_transaction(db, value, existing)}
 
 
 @app.delete("/api/transactions/{transaction_id}")

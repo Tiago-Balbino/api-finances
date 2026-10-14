@@ -206,3 +206,10 @@ def simulate_payoff(balance: int, bills: list[dict], incomes: list[dict], today:
         "interest_cents": sum(debt["paid"] for debt in debts) + leftover - sum(debt["base"] for debt in debts),
         "unpaid_at_horizon_cents": leftover, "unpaid_count": len(unpaid), "cash_left_cents": cash,
         "timeline": timeline}
+
+
+def payments_fit(bill: dict, payments: list[dict]) -> bool:
+    """True when, in date order, no payment is larger than what was owed on its day."""
+    ordered = sorted(payments, key=lambda item: (item["date"], item["id"]))
+    return all(item["amount_cents"] <= (debt_cents_at(bill, ordered[:index], item["date"]) or 0)
+        for index, item in enumerate(ordered))
