@@ -1,0 +1,11 @@
+.git
+.pgdata
+.pgsocket
+.venv
+node_modules
+__pycache__
+*.pyc
+.env
+test
+spec
+scripts
