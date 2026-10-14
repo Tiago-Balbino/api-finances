@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from app.main import (app, bcb_observations, category_choice, daily_yield_cents, fixed_rate_projection, materialize_fixed_bills,
+from app.main import (app, bcb_observations, category_choice, daily_yield_cents, fixed_rate_projection, forecast_series,
+                      materialize_fixed_bills,
                       materialize_fixed_incomes, monthly_payables, monthly_receivables,
                       verify_password, yield_start)
 
@@ -79,13 +80,15 @@ class ApiTests(unittest.TestCase):
     def test_expected_routes_exist(self):
         paths = {route.path for route in app.routes}
         self.assertTrue({"/health", "/api/state", "/api/dashboard", "/api/accounts/{account_id}/details",
-            "/api/categories", "/api/subcategories", "/api/bills/{bill_id}/classification"} <= paths)
+            "/api/categories", "/api/subcategories", "/api/bills/{bill_id}/classification", "/api/forecast",
+            "/api/cards", "/api/cards/{card_id}/collateral", "/api/card-purchases/{purchase_id}"} <= paths)
 
     def test_fixed_expense_repeats_monthly_from_original_day(self):
         db = FakeRecurringBills()
         materialize_fixed_bills(db, date(2026, 2, 15))
         self.assertEqual(db.due_dates, [date(2026, 2, 28), date(2026, 3, 31),
-            date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31)])
+            date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31), date(2026, 8, 31),
+            date(2026, 9, 30), date(2026, 10, 31), date(2026, 11, 30), date(2026, 12, 31), date(2027, 1, 31)])
 
     def test_unpaid_expense_carries_into_each_next_month(self):
         bill = {"id": 1, "amount_cents": 10000, "due_date": date(2026, 9, 10),
@@ -99,7 +102,8 @@ class ApiTests(unittest.TestCase):
         db = FakeRecurringIncomes()
         materialize_fixed_incomes(db, date(2026, 2, 15))
         self.assertEqual(db.due_dates, [date(2026, 2, 28), date(2026, 3, 31),
-            date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31)])
+            date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31), date(2026, 8, 31),
+            date(2026, 9, 30), date(2026, 10, 31), date(2026, 11, 30), date(2026, 12, 31), date(2027, 1, 31)])
         income = {"id": 1, "due_date": date(2026, 9, 10), "remaining_cents": 300000}
         series = monthly_receivables([income], date(2026, 10, 14))
         self.assertEqual([point["value_cents"] for point in series], [300000] * 6)
@@ -125,6 +129,25 @@ class ApiTests(unittest.TestCase):
         self.assertGreater(points[2]["value_cents"], points[1]["value_cents"])
         self.assertEqual(fixed_rate_projection(100000, None, 10000, date(2026, 1, 31)),
             [{"date": date(2026, 1, 31), "value_cents": 100000, "yield_cents": 0}])
+
+    def test_forecast_never_assumes_payment_and_accumulates_interest(self):
+        overdue = {"id": 1, "amount_cents": 10000, "due_date": date(2026, 9, 10),
+                   "interest_rate_basis_points": 100, "interest_period": "monthly",
+                   "status": "overdue", "payments": []}
+        upcoming = {"id": 2, "amount_cents": 5000, "due_date": date(2026, 11, 20),
+                    "interest_rate_basis_points": 0, "interest_period": "monthly",
+                    "status": "pending", "payments": []}
+        salary = {"id": 3, "due_date": date(2026, 11, 5), "remaining_cents": 300000}
+        series = forecast_series(20000, [overdue, upcoming], [salary], date(2026, 10, 14), 3)
+        self.assertEqual(len(series), 4)
+        october, november, december = series[0], series[1], series[2]
+        self.assertEqual(october["balance_cents"], 20000)
+        self.assertEqual(november["balance_cents"], 320000)
+        self.assertEqual(november["payable_month_cents"], 5000)
+        self.assertEqual(december["payable_month_cents"], 0)
+        self.assertGreater(december["payable_carried_cents"], november["payable_carried_cents"] - 5000)
+        self.assertEqual(december["balance_cents"], 320000)
+        self.assertEqual(december["gap_cents"], december["balance_cents"] - december["payable_cents"])
 
 
 if __name__ == "__main__":

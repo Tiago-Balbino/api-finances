@@ -58,25 +58,75 @@ def projected_cents(principal: int, basis_points: int, start: date, end: date, p
     return floor(amount + 0.5) if isfinite(amount) and abs(amount) < 2**53 else None
 
 
+PERIOD_DAYS = {"daily": 1, "monthly": 30, "yearly": 360}
+
+
+def applied_rate(bill: dict) -> float:
+    """Rate in basis points for each application period, converted pro rata from the informed rate period.
+
+    Example: 2% a month applied daily is 2% / 30 per day."""
+    period = bill["interest_period"]
+    rate_period = bill.get("interest_rate_period") or period
+    return bill["interest_rate_basis_points"] * PERIOD_DAYS[period] / PERIOD_DAYS[rate_period]
+
+
+def fine_date(due: date, after: str) -> date:
+    return due + timedelta(days=1) if after == "day" else add_months(due, 1 if after == "month" else 12)
+
+
 def debt_cents_at(bill: dict, payments: list[dict], as_of: date) -> int | None:
     balance = bill["amount_cents"]
-    last = bill["due_date"]
     due = bill["due_date"]
-    rate = bill["interest_rate_basis_points"]
+    rate = applied_rate(bill)
     period = bill["interest_period"]
+    fine = bill.get("fine_basis_points") or 0
+    fine_at = fine_date(due, bill.get("fine_after") or "day") if fine else None
+    last = due
+
+    def accrue(amount: int, until: date) -> int:
+        # Interest is charged once per complete application period after the due date.
+        if until <= last or amount <= 0 or not rate:
+            return amount
+        exponent = floor(periods(due, until, period)) - floor(periods(due, last, period))
+        return floor(amount * (1 + rate / 10000) ** exponent + 0.5)
+
     for payment in sorted((p for p in payments if p["date"] <= as_of), key=lambda p: (p["date"], p["id"])):
         when = payment["date"]
-        if when > due and when > last and balance > 0:
-            exponent = periods(due, when, period) - periods(due, last, period)
-            balance = floor(balance * (1 + rate / 10000) ** exponent + 0.5)
+        if fine_at and fine_at <= when:
+            balance, last = accrue(balance, fine_at), max(last, fine_at)
+            balance += floor(balance * fine / 10000 + 0.5) if balance > 0 else 0
+            fine_at = None
+        balance, last = accrue(balance, when), max(last, when)
         balance = max(0, balance - payment["amount_cents"])
-        last = max(last, when)
-    if as_of > due and as_of > last and balance > 0:
-        exponent = periods(due, as_of, period) - periods(due, last, period)
-        balance = floor(balance * (1 + rate / 10000) ** exponent + 0.5)
+    if fine_at and fine_at <= as_of:
+        balance, last = accrue(balance, fine_at), max(last, fine_at)
+        balance += floor(balance * fine / 10000 + 0.5) if balance > 0 else 0
+    balance = accrue(balance, as_of)
     return balance if abs(balance) < 2**53 else None
 
 
 def bill_status(bill: dict, payments: list[dict], as_of: date) -> str:
     balance = debt_cents_at(bill, payments, as_of)
     return "paid" if balance == 0 else "overdue" if bill["due_date"] < as_of else "pending"
+
+
+def day_in_month(year: int, month: int, day: int) -> date:
+    return date(year, month, min(day, monthrange(year, month)[1]))
+
+
+def invoice_dates(purchase: date, closing_day: int, due_day: int, offset: int = 0) -> tuple[date, date]:
+    """Closing and due dates of the invoice that receives a purchase installment.
+
+    Purchases made on the closing day or later go to the next cycle."""
+    month = purchase.replace(day=1)
+    if purchase >= day_in_month(purchase.year, purchase.month, closing_day):
+        month = add_months(month, 1)
+    month = add_months(month, offset)
+    closing = day_in_month(month.year, month.month, closing_day)
+    due_month = month if due_day > closing_day else add_months(month, 1)
+    return closing, day_in_month(due_month.year, due_month.month, due_day)
+
+
+def split_installments(total_cents: int, count: int) -> list[int]:
+    base = total_cents // count
+    return [base + total_cents - base * count] + [base] * (count - 1)

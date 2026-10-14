@@ -76,6 +76,11 @@ ALTER TABLE bills ADD COLUMN IF NOT EXISTS recurrence_month DATE;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS recurrence_active BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE UNIQUE INDEX IF NOT EXISTS bills_recurrence_month_idx ON bills(recurrence_origin_id, recurrence_month);
+ALTER TABLE bills DROP CONSTRAINT IF EXISTS bills_interest_period_check;
+ALTER TABLE bills ADD CONSTRAINT bills_interest_period_check CHECK (interest_period IN ('daily', 'monthly', 'yearly'));
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS interest_rate_period TEXT CHECK (interest_rate_period IN ('daily', 'monthly', 'yearly'));
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS fine_basis_points INTEGER NOT NULL DEFAULT 0 CHECK (fine_basis_points BETWEEN 0 AND 10000);
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS fine_after TEXT NOT NULL DEFAULT 'day' CHECK (fine_after IN ('day', 'month', 'year'));
 CREATE TABLE IF NOT EXISTS planned_incomes (
   id BIGSERIAL PRIMARY KEY,
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
@@ -127,6 +132,40 @@ CREATE TABLE IF NOT EXISTS investments (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE investments ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS credit_cards (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+  payment_account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  collateral_account_id BIGINT UNIQUE REFERENCES accounts(id) ON DELETE RESTRICT,
+  base_limit_cents BIGINT NOT NULL DEFAULT 0 CHECK (base_limit_cents >= 0),
+  closing_day INTEGER NOT NULL CHECK (closing_day BETWEEN 1 AND 31),
+  due_day INTEGER NOT NULL CHECK (due_day BETWEEN 1 AND 31),
+  late_interest_basis_points INTEGER NOT NULL DEFAULT 0 CHECK (late_interest_basis_points BETWEEN 0 AND 10000),
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS card_purchases (
+  id BIGSERIAL PRIMARY KEY,
+  credit_card_id BIGINT NOT NULL REFERENCES credit_cards(id) ON DELETE RESTRICT,
+  description TEXT NOT NULL,
+  total_cents BIGINT NOT NULL CHECK (total_cents > 0),
+  installments INTEGER NOT NULL CHECK (installments BETWEEN 1 AND 48),
+  purchase_date DATE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'pix' CHECK (payment_method IN ('pix', 'debit', 'credit'));
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS credit_card_id BIGINT REFERENCES credit_cards(id) ON DELETE RESTRICT;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS invoice_month DATE;
+CREATE UNIQUE INDEX IF NOT EXISTS bills_card_invoice_idx ON bills(credit_card_id, invoice_month);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT CHECK (payment_method IN ('pix', 'debit', 'credit'));
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS movement_type TEXT NOT NULL DEFAULT 'regular'
+  CHECK (movement_type IN ('regular', 'card_purchase', 'invoice_payment', 'transfer'));
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS credit_card_id BIGINT REFERENCES credit_cards(id) ON DELETE RESTRICT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_purchase_id BIGINT REFERENCES card_purchases(id) ON DELETE RESTRICT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS invoice_bill_id BIGINT REFERENCES bills(id) ON DELETE RESTRICT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS installment_number INTEGER;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transfer_group BIGINT;
+CREATE SEQUENCE IF NOT EXISTS transfer_group_seq;
 INSERT INTO categories(kind,name)
 SELECT 'expense', category FROM bills WHERE trim(category) <> ''
 ON CONFLICT DO NOTHING;
@@ -136,6 +175,7 @@ ON CONFLICT DO NOTHING;
 INSERT INTO categories(kind,name) VALUES
   ('expense','Moradia'),('expense','Alimentação'),('expense','Transporte'),
   ('expense','Saúde'),('expense','Educação'),('expense','Lazer'),('expense','Outros'),
+  ('expense','Cartão de crédito'),
   ('income','Salário'),('income','Serviços'),('income','Investimentos'),('income','Outros')
 ON CONFLICT DO NOTHING;
 UPDATE bills b SET category_id=c.id FROM categories c
@@ -148,6 +188,8 @@ CREATE INDEX IF NOT EXISTS transactions_bill_idx ON transactions(bill_id);
 CREATE INDEX IF NOT EXISTS bills_due_idx ON bills(due_date);
 CREATE INDEX IF NOT EXISTS transactions_category_date_idx ON transactions(category_id,date DESC);
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS transactions_invoice_bill_idx ON transactions(invoice_bill_id);
+CREATE INDEX IF NOT EXISTS transactions_card_purchase_idx ON transactions(card_purchase_id);
 
 -- Bloqueia acesso pela API REST do Supabase (anon/authenticated). A aplicação conecta como dona das tabelas e não é afetada.
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -162,3 +204,5 @@ ALTER TABLE investments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE yield_rates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE yield_rate_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE passive_yields ENABLE ROW LEVEL SECURITY;
+ALTER TABLE credit_cards ENABLE ROW LEVEL SECURITY;
+ALTER TABLE card_purchases ENABLE ROW LEVEL SECURITY;

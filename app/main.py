@@ -22,7 +22,8 @@ from fastapi.responses import JSONResponse
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from psycopg.rows import dict_row
 
-from .finance import add_months, bill_status, debt_cents_at, is_business_day, projected_cents, today
+from .finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, projected_cents,
+                      split_installments, today)
 
 
 def connect():
@@ -102,9 +103,27 @@ def parsed_date(value: Any) -> date:
 
 
 def interest(value: Any, period: Any) -> int:
-    if period not in ("daily", "monthly"):
+    if period not in ("daily", "monthly", "yearly"):
         fail(400, "Periodicidade dos juros inválida.")
     return integer(value, "Taxa de juros", 0, 1000 if period == "daily" else 10000)
+
+
+def interest_period(value: Any) -> str:
+    if value not in ("daily", "monthly", "yearly"):
+        fail(400, "Aplicação dos juros inválida.")
+    return value
+
+
+def bill_extras(value: dict) -> tuple:
+    """Payment method, period of the informed interest rate and the one-time late fine."""
+    rate_period = value.get("interestRatePeriod") or value.get("interestPeriod")
+    if rate_period not in ("daily", "monthly", "yearly"):
+        fail(400, "Período da taxa de juros inválido.")
+    fine_after = value.get("fineAfter", "day")
+    if fine_after not in ("day", "month", "year"):
+        fail(400, "Prazo da multa inválido.")
+    return (payment_method(value.get("paymentMethod", "pix")), rate_period,
+        integer(value.get("fineBasisPoints", 0), "Multa", 0, 10000), fine_after)
 
 
 def kind(value: Any) -> str:
@@ -189,17 +208,37 @@ def admin(result):
         fail(403, "Somente o administrador pode fazer isso.")
 
 
+FORECAST_MONTHS = 12
+PAYMENT_METHODS = ("pix", "debit", "credit")
+
+
+def payment_method(value: Any) -> str:
+    if value not in PAYMENT_METHODS:
+        fail(400, "Forma de pagamento inválida.")
+    return value
+
+
 def bill_rows(db, as_of: date):
     bills = all_rows(db, """SELECT b.*,origin.recurrence_active AS series_active,
-        c.name AS category_name,s.name AS subcategory_name,a.name AS account_name
-        FROM bills b JOIN accounts a ON a.id=b.account_id
+        c.name AS category_name,s.name AS subcategory_name,a.name AS account_name,cc.name AS card_name
+        FROM bills b JOIN accounts a ON a.id=b.account_id LEFT JOIN credit_cards cc ON cc.id=b.credit_card_id
         LEFT JOIN bills origin ON origin.id=COALESCE(b.recurrence_origin_id,b.id)
         LEFT JOIN categories c ON c.id=b.category_id LEFT JOIN subcategories s ON s.id=b.subcategory_id
         WHERE b.archived=FALSE ORDER BY b.due_date,b.id""")
-    payments = all_rows(db, """SELECT t.id,t.bill_id,t.account_id,t.amount_cents,t.date,t.note,a.name AS account_name
-        FROM transactions t JOIN accounts a ON a.id=t.account_id WHERE t.bill_id IS NOT NULL ORDER BY t.date,t.id""")
+    payments = all_rows(db, """SELECT t.id,t.bill_id,t.account_id,t.amount_cents,t.date,t.note,t.payment_method,
+        t.card_purchase_id,cp.installments,cc.name AS card_name,a.name AS account_name
+        FROM transactions t JOIN accounts a ON a.id=t.account_id
+        LEFT JOIN card_purchases cp ON cp.id=t.card_purchase_id LEFT JOIN credit_cards cc ON cc.id=t.credit_card_id
+        WHERE t.bill_id IS NOT NULL ORDER BY t.date,t.id""")
     by_bill: dict[int, list[dict]] = {}
+    purchases: dict[int, dict] = {}
     for payment in payments:
+        # A credit payment has one row per installment; show and settle it as a single payment.
+        if payment["card_purchase_id"]:
+            if payment["card_purchase_id"] in purchases:
+                purchases[payment["card_purchase_id"]]["amount_cents"] += payment["amount_cents"]
+                continue
+            payment = purchases.setdefault(payment["card_purchase_id"], dict(payment))
         by_bill.setdefault(payment["bill_id"], []).append(payment)
     result = []
     for bill in bills:
@@ -214,7 +253,7 @@ def bill_rows(db, as_of: date):
 
 def materialize_fixed_bills(db, as_of: date):
     """Create one independent payable bill per month, without duplicating existing months."""
-    last_month = add_months(as_of.replace(day=1), 5)
+    last_month = add_months(as_of.replace(day=1), FORECAST_MONTHS - 1)
     horizon = add_months(last_month, 1)
     origins = all_rows(db, """SELECT * FROM bills WHERE expense_type='fixed'
         AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
@@ -226,16 +265,18 @@ def materialize_fixed_bills(db, as_of: date):
             month = due.replace(day=1)
             db.execute("""INSERT INTO bills(account_id,description,category,category_id,subcategory_id,note,
                 amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,
-                recurrence_origin_id,recurrence_month)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s)
+                recurrence_origin_id,recurrence_month,payment_method,interest_rate_period,fine_basis_points,fine_after)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
                 (origin["account_id"], origin["description"], origin["category"], origin["category_id"],
                  origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
-                 origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], month))
+                 origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], month,
+                 origin.get("payment_method", "pix"), origin.get("interest_rate_period"),
+                 origin.get("fine_basis_points", 0), origin.get("fine_after", "day")))
 
 
 def materialize_fixed_incomes(db, as_of: date):
-    last_month = add_months(as_of.replace(day=1), 5)
+    last_month = add_months(as_of.replace(day=1), FORECAST_MONTHS - 1)
     horizon = add_months(last_month, 1)
     origins = all_rows(db, """SELECT * FROM planned_incomes WHERE income_type='fixed'
         AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
@@ -277,9 +318,9 @@ def income_rows(db, as_of: date):
     return result
 
 
-def monthly_receivables(incomes: list[dict], current: date) -> list[dict]:
+def monthly_receivables(incomes: list[dict], current: date, months: int = 6) -> list[dict]:
     series = []
-    for offset in range(6):
+    for offset in range(months):
         start = add_months(current.replace(day=1), offset)
         end = add_months(start, 1) - timedelta(days=1)
         items = [{"id": item["id"], "value_cents": item["remaining_cents"],
@@ -407,7 +448,7 @@ def accrue_passive_yields(db, now: datetime | None = None) -> int:
                 at_eight = datetime.combine(current, clock_time(8), tzinfo=YIELD_ZONE)
                 balance = one(db, """SELECT a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income'
                     THEN t.amount_cents ELSE -t.amount_cents END),0) AS cents
-                    FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id
+                    FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id AND t.movement_type<>'card_purchase'
                     AND (t.date < %s OR (t.date = %s AND t.created_at <= %s))
                     WHERE a.id=%s GROUP BY a.id""", (current, current, at_eight, account["id"]))["cents"]
                 observation = one(db, """SELECT annual_basis_points FROM yield_rate_observations
@@ -431,9 +472,9 @@ def accrue_passive_yields(db, now: datetime | None = None) -> int:
     return created
 
 
-def monthly_payables(bills: list[dict], current: date) -> list[dict]:
+def monthly_payables(bills: list[dict], current: date, months: int = 6) -> list[dict]:
     series = []
-    for i in range(6):
+    for i in range(months):
         month_start = add_months(current.replace(day=1), i)
         month_end = add_months(month_start, 1) - timedelta(days=1)
         projection_date = current if i == 0 else month_end
@@ -443,6 +484,122 @@ def monthly_payables(bills: list[dict], current: date) -> list[dict]:
         series.append({"date": month_start, "value_cents": sum(item["value_cents"] or 0 for item in items),
             "items": items})
     return series
+
+
+def forecast_series(balance_cents: int, bills: list[dict], incomes: list[dict], current: date,
+                    months: int = FORECAST_MONTHS) -> list[dict]:
+    """Project each month assuming no open bill is ever paid: unpaid bills keep accumulating
+    (with interest) and never reduce the balance; planned incomes arrive on their due date."""
+    payables = monthly_payables(bills, current, months + 1)
+    receivables = monthly_receivables(incomes, current, months + 1)
+    series = []
+    for payable, receivable in zip(payables, receivables):
+        carried = sum(item["value_cents"] or 0 for item in payable["items"] if item["carried"])
+        balance = balance_cents + receivable["value_cents"]
+        series.append({"date": payable["date"], "balance_cents": balance,
+            "receivable_cents": receivable["value_cents"], "payable_cents": payable["value_cents"],
+            "payable_month_cents": payable["value_cents"] - carried, "payable_carried_cents": carried,
+            "gap_cents": balance - payable["value_cents"],
+            "items": payable["items"], "income_items": receivable["items"]})
+    return series
+
+
+def card_for_account(db, card_id: Any, account_id: int) -> dict:
+    card = one(db, "SELECT * FROM credit_cards WHERE id=%s FOR UPDATE",
+        (integer(card_id, "Cartão"),))
+    if not card:
+        fail(400, "Cartão inválido.")
+    if card["payment_account_id"] != account_id:
+        fail(400, "Este cartão não pertence à conta escolhida.")
+    return card
+
+
+def card_limits(db, card: dict, as_of: date) -> dict:
+    collateral = 0
+    if card["collateral_account_id"]:
+        collateral = one(db, """SELECT a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income'
+            THEN t.amount_cents ELSE -t.amount_cents END),0) AS cents
+            FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id AND t.date<=%s
+            AND t.movement_type<>'card_purchase' WHERE a.id=%s GROUP BY a.id""",
+            (as_of, card["collateral_account_id"]))["cents"]
+    invoices = all_rows(db, "SELECT * FROM bills WHERE credit_card_id=%s", (card["id"],))
+    paid = all_rows(db, """SELECT t.id,t.bill_id,t.amount_cents,t.date FROM transactions t
+        JOIN bills b ON b.id=t.bill_id WHERE b.credit_card_id=%s ORDER BY t.date,t.id""", (card["id"],))
+    used = 0
+    for invoice in invoices:
+        history = [item for item in paid if item["bill_id"] == invoice["id"]]
+        used += debt_cents_at(invoice, history, max(as_of, invoice["due_date"])) or 0
+    total = card["base_limit_cents"] + max(0, collateral)
+    return {"collateral_cents": collateral, "limit_cents": total, "used_cents": used,
+        "available_cents": total - used}
+
+
+def card_rows(db, as_of: date) -> list[dict]:
+    cards = all_rows(db, """SELECT c.*,pa.name AS payment_account_name,ca.name AS collateral_account_name,
+        ca.yield_rate_id,ca.yield_multiplier_basis_points,r.name AS yield_rate_name,
+        r.annual_basis_points AS yield_annual_basis_points
+        FROM credit_cards c JOIN accounts pa ON pa.id=c.payment_account_id
+        LEFT JOIN accounts ca ON ca.id=c.collateral_account_id
+        LEFT JOIN yield_rates r ON r.id=ca.yield_rate_id ORDER BY c.id""")
+    return [{**card, **card_limits(db, card, as_of)} for card in cards]
+
+
+def ensure_invoice(db, card: dict, closing: date, due: date) -> int:
+    month = due.replace(day=1)
+    existing = one(db, "SELECT id FROM bills WHERE credit_card_id=%s AND invoice_month=%s", (card["id"], month))
+    if existing:
+        return existing["id"]
+    category = one(db, "SELECT id,name FROM categories WHERE kind='expense' AND name='Cartão de crédito'")
+    return one(db, """INSERT INTO bills(account_id,description,category,category_id,note,amount_cents,due_date,
+        interest_rate_basis_points,interest_period,interest_rate_period,expense_type,payment_method,credit_card_id,
+        invoice_month) VALUES(%s,%s,%s,%s,%s,1,%s,%s,'daily','monthly','eventual','pix',%s,%s) RETURNING id""",
+        (card["payment_account_id"], f"Fatura {card['name']} · {due:%m/%Y}",
+         category["name"] if category else "Cartão de crédito", category["id"] if category else None,
+         f"Fecha em {closing:%d/%m/%Y}", due, card["late_interest_basis_points"], card["id"], month))["id"]
+
+
+def refresh_invoice(db, bill_id: int):
+    total = one(db, "SELECT COALESCE(SUM(amount_cents),0)::bigint AS cents FROM transactions WHERE invoice_bill_id=%s",
+        (bill_id,))["cents"]
+    if total:
+        db.execute("UPDATE bills SET amount_cents=%s WHERE id=%s", (total, bill_id))
+    elif not one(db, "SELECT id FROM transactions WHERE bill_id=%s LIMIT 1", (bill_id,)):
+        db.execute("DELETE FROM bills WHERE id=%s", (bill_id,))
+
+
+def create_card_purchase(db, card: dict, description: str, category: tuple, purchase_note: str,
+                         total: int, when: date, installments: int, bill_id: int | None = None) -> int:
+    limits = card_limits(db, card, when)
+    if total > limits["available_cents"]:
+        available = f"{max(0, limits['available_cents']) / 100:,.2f}".translate(str.maketrans(",.", ".,"))
+        fail(400, f"Limite disponível insuficiente no cartão {card['name']} (R$ {available}).")
+    category_name, category_id, subcategory_id = category
+    purchase_id = one(db, """INSERT INTO card_purchases(credit_card_id,description,total_cents,installments,purchase_date)
+        VALUES(%s,%s,%s,%s,%s) RETURNING id""", (card["id"], description, total, installments, when))["id"]
+    for number, amount in enumerate(split_installments(total, installments), start=1):
+        closing, due = invoice_dates(when, card["closing_day"], card["due_day"], number - 1)
+        invoice_id = ensure_invoice(db, card, closing, due)
+        db.execute("""INSERT INTO transactions(account_id,kind,description,category,category_id,subcategory_id,note,
+            amount_cents,date,payment_method,movement_type,credit_card_id,card_purchase_id,invoice_bill_id,
+            installment_number,bill_id) VALUES(%s,'expense',%s,%s,%s,%s,%s,%s,%s,'credit','card_purchase',%s,%s,%s,%s,%s)""",
+            (card["payment_account_id"], f"{description} ({number}/{installments})" if installments > 1 else description,
+             category_name, category_id, subcategory_id, purchase_note, amount, when, card["id"], purchase_id,
+             invoice_id, number, bill_id))
+        refresh_invoice(db, invoice_id)
+    return purchase_id
+
+
+def remove_card_purchase(db, purchase_id: int):
+    rows = all_rows(db, "SELECT id,invoice_bill_id FROM transactions WHERE card_purchase_id=%s FOR UPDATE", (purchase_id,))
+    if not rows:
+        fail(404, "Compra não encontrada.")
+    invoices = sorted({row["invoice_bill_id"] for row in rows})
+    if one(db, "SELECT id FROM transactions WHERE bill_id = ANY(%s) LIMIT 1", (invoices,)):
+        fail(409, "Esta compra está em uma fatura com pagamento. Exclua os pagamentos da fatura primeiro.")
+    db.execute("DELETE FROM transactions WHERE card_purchase_id=%s", (purchase_id,))
+    db.execute("DELETE FROM card_purchases WHERE id=%s", (purchase_id,))
+    for invoice_id in invoices:
+        refresh_invoice(db, invoice_id)
 
 
 @app.get("/health")
@@ -516,14 +673,17 @@ def state(who=Depends(user), db=Depends(db_session)):
     sync_dynamic_rates(db, current)
     accrue_passive_yields(db)
     accounts = all_rows(db, """SELECT a.*,r.name AS yield_rate_name,r.annual_basis_points AS yield_annual_basis_points,
+        (SELECT cc.id FROM credit_cards cc WHERE cc.collateral_account_id=a.id) AS collateral_card_id,
         a.opening_cents + COALESCE(SUM(CASE WHEN t.date>%s THEN 0
         WHEN t.kind='income' THEN t.amount_cents ELSE -t.amount_cents END),0) AS balance_cents
         FROM accounts a LEFT JOIN yield_rates r ON r.id=a.yield_rate_id
-        LEFT JOIN transactions t ON t.account_id=a.id GROUP BY a.id,r.id ORDER BY a.id DESC""", (current,))
+        LEFT JOIN transactions t ON t.account_id=a.id AND t.movement_type<>'card_purchase'
+        GROUP BY a.id,r.id ORDER BY a.id DESC""", (current,))
     transactions = all_rows(db, """SELECT t.*,py.transaction_id IS NOT NULL AS automatic_yield,
-        a.name AS account_name,COALESCE(c.name,t.category) AS category_name,
-        s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id=t.account_id
+        a.name AS account_name,COALESCE(c.name,t.category) AS category_name,cc.name AS card_name,
+        cp.installments,s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id=t.account_id
         LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        LEFT JOIN credit_cards cc ON cc.id=t.credit_card_id LEFT JOIN card_purchases cp ON cp.id=t.card_purchase_id
         LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN subcategories s ON s.id=t.subcategory_id
         ORDER BY t.date DESC,t.id DESC LIMIT 500""")
     for transaction in transactions:
@@ -541,7 +701,8 @@ def state(who=Depends(user), db=Depends(db_session)):
     month_start = current.replace(day=1)
     month_end = add_months(month_start, 1)
     month_totals_rows = all_rows(db, """SELECT kind,SUM(amount_cents)::bigint AS amount_cents FROM transactions
-        WHERE date >= %s AND date <= %s GROUP BY kind""", (month_start, current))
+        WHERE date >= %s AND date <= %s AND movement_type IN ('regular','card_purchase')
+        GROUP BY kind""", (month_start, current))
     month_totals = {"income_cents": 0, "expense_cents": 0}
     for item in month_totals_rows:
         month_totals[f"{item['kind']}_cents"] = item["amount_cents"]
@@ -550,18 +711,52 @@ def state(who=Depends(user), db=Depends(db_session)):
         FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
         LEFT JOIN subcategories s ON s.id=t.subcategory_id
         WHERE t.kind='expense' AND t.date >= %s AND t.date < %s AND t.date <= %s
+        AND t.movement_type IN ('regular','card_purchase')
         GROUP BY t.category_id,COALESCE(c.name,t.category),t.subcategory_id,s.name ORDER BY amount_cents DESC""", (month_start, month_end, current))
     investment_series = [{"date": add_months(current, i), "value_cents": sum(projected_cents(x["principal_cents"], x["rate_basis_points"], x["start_date"], add_months(current, i), x["period"]) or 0 for x in investments)} for i in range(13)]
     debt_series = [{"date": add_months(current, i), "value_cents": sum(debt_cents_at(x, x["payments"], add_months(current, i)) or 0 for x in bills)} for i in range(13)]
     due_series = monthly_payables(bills, current)
     income_series = monthly_receivables(incomes, current)
     users = all_rows(db, "SELECT id,name,email,role,active FROM users ORDER BY id") if who["role"] == "admin" else []
+    credit_cards = card_rows(db, current)
+    card_purchases = all_rows(db, """SELECT p.*,cc.name AS card_name,
+        MIN(t.category) AS category,MIN(t.category_id) AS category_id,MIN(t.subcategory_id) AS subcategory_id,
+        MIN(t.note) AS note,MIN(t.bill_id) AS bill_id,
+        COALESCE(SUM(t.amount_cents) FILTER (WHERE b.due_date > %s),0)::bigint AS remaining_cents
+        FROM card_purchases p JOIN credit_cards cc ON cc.id=p.credit_card_id
+        JOIN transactions t ON t.card_purchase_id=p.id JOIN bills b ON b.id=t.invoice_bill_id
+        GROUP BY p.id,cc.name ORDER BY p.purchase_date DESC,p.id DESC LIMIT 300""", (current,))
     return jsonable_encoder({"user": who, "today": current, "accounts": accounts, "transactions": transactions,
+        "credit_cards": credit_cards, "card_purchases": card_purchases,
         "investments": investments, "bills": bills, "incomes": incomes, "income_series": income_series,
         "categories": categories, "subcategories": subcategories,
         "yield_rates": yield_rates,
         "monthly_spending": spending, "monthly_totals": month_totals, "investment_series": investment_series,
         "debt_series": debt_series, "due_series": due_series, "users": users})
+
+
+def account_forecast(db, current: date, account_id: int | None) -> list[dict]:
+    # Collateral accounts back a card limit and are not money available to spend.
+    balance = one(db, """SELECT COALESCE(SUM(a.opening_cents + COALESCE((SELECT SUM(CASE WHEN t.kind='income'
+        THEN t.amount_cents ELSE -t.amount_cents END) FROM transactions t WHERE t.account_id=a.id
+        AND t.date<=%s AND t.movement_type<>'card_purchase'),0)),0)::bigint AS cents
+        FROM accounts a WHERE (%s::bigint IS NULL OR a.id=%s)
+        AND NOT EXISTS (SELECT 1 FROM credit_cards cc WHERE cc.collateral_account_id=a.id)""",
+        (current, account_id, account_id))["cents"]
+    bills = [item for item in bill_rows(db, current) if account_id is None or item["account_id"] == account_id]
+    incomes = [item for item in income_rows(db, current) if account_id is None or item["account_id"] == account_id]
+    return forecast_series(balance, bills, incomes, current)
+
+
+@app.get("/api/forecast")
+def forecast(accountId: int | None = None, who=Depends(user), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    materialize_fixed_bills(db, current)
+    materialize_fixed_incomes(db, current)
+    if accountId is not None and not one(db, "SELECT id FROM accounts WHERE id=%s", (accountId,)):
+        fail(404, "Conta não encontrada.")
+    return jsonable_encoder({"account_id": accountId, "series": [{key: value for key, value in item.items()
+        if not key.endswith("items")} for item in account_forecast(db, current, accountId)]})
 
 
 @app.get("/api/dashboard")
@@ -576,13 +771,32 @@ def dashboard(month: str | None = None, accountId: int | None = None,
     cutoff = min(end - timedelta(days=1), current)
     if accountId is not None and not one(db, "SELECT id FROM accounts WHERE id=%s", (accountId,)):
         fail(404, "Conta não encontrada.")
+    if start > current.replace(day=1):
+        offset = (start.year - current.year) * 12 + start.month - current.month
+        if offset > FORECAST_MONTHS:
+            fail(400, f"A previsão alcança até {FORECAST_MONTHS} meses à frente.")
+        series = account_forecast(db, current, accountId)
+        point = series[offset]
+        bills = {item["id"]: item for item in bill_rows(db, current)}
+        incomes = {item["id"]: item for item in income_rows(db, current)}
+        point["items"] = [{**item, "description": bills[item["id"]]["description"],
+            "account_name": bills[item["id"]]["account_name"], "due_date": bills[item["id"]]["due_date"],
+            "amount_cents": bills[item["id"]]["amount_cents"], "card_name": bills[item["id"]]["card_name"],
+            "category": bills[item["id"]]["category"], "expense_type": bills[item["id"]]["expense_type"]}
+            for item in point["items"]]
+        point["income_items"] = [{**item, "description": incomes[item["id"]]["description"],
+            "account_name": incomes[item["id"]]["account_name"], "due_date": incomes[item["id"]]["due_date"]}
+            for item in point["income_items"]]
+        return jsonable_encoder({"mode": "forecast", "month": start, "account_id": accountId, "forecast": point,
+            "series": [{key: value for key, value in item.items() if not key.endswith("items")} for item in series]})
     totals = {"income_cents": 0, "expense_cents": 0, "yield_cents": 0, "transaction_count": 0}
     summary = one(db, """SELECT COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='income'),0)::bigint AS income_cents,
         COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='expense'),0)::bigint AS expense_cents,
         COALESCE(SUM(t.amount_cents) FILTER (WHERE py.transaction_id IS NOT NULL),0)::bigint AS yield_cents,
-        COUNT(*)::bigint AS transaction_count FROM transactions t
+        COUNT(DISTINCT COALESCE(-t.card_purchase_id,t.id))::bigint AS transaction_count FROM transactions t
         LEFT JOIN passive_yields py ON py.transaction_id=t.id
         WHERE t.date >= %s AND t.date < %s AND t.date <= %s
+        AND t.movement_type IN ('regular','card_purchase')
         AND (%s::bigint IS NULL OR t.account_id=%s)""", (start, end, current, accountId, accountId))
     totals.update(summary)
     categories = all_rows(db, """SELECT t.kind,t.category_id,COALESCE(c.name,t.category) AS category,
@@ -590,31 +804,35 @@ def dashboard(month: str | None = None, accountId: int | None = None,
         FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
         LEFT JOIN subcategories s ON s.id=t.subcategory_id
         WHERE t.date >= %s AND t.date < %s AND t.date <= %s
+        AND t.movement_type IN ('regular','card_purchase')
         AND (%s::bigint IS NULL OR t.account_id=%s)
         GROUP BY t.kind,t.category_id,COALESCE(c.name,t.category),t.subcategory_id,s.name
         ORDER BY amount_cents DESC""", (start, end, current, accountId, accountId))
     days = all_rows(db, """SELECT date,kind,SUM(amount_cents)::bigint AS amount_cents FROM transactions
         WHERE date >= %s AND date < %s AND date <= %s AND (%s::bigint IS NULL OR account_id=%s)
+        AND movement_type IN ('regular','card_purchase')
         GROUP BY date,kind ORDER BY date""", (start, end, current, accountId, accountId))
     recent = all_rows(db, """SELECT t.id,t.account_id,t.kind,t.description,t.amount_cents,t.date,
-        COALESCE(c.name,t.category) AS category,a.name AS account_name,
+        t.payment_method,t.movement_type,COALESCE(c.name,t.category) AS category,a.name AS account_name,
         py.transaction_id IS NOT NULL AS automatic_yield FROM transactions t
         JOIN accounts a ON a.id=t.account_id LEFT JOIN categories c ON c.id=t.category_id
         LEFT JOIN passive_yields py ON py.transaction_id=t.id
         WHERE t.date >= %s AND t.date < %s AND t.date <= %s
+        AND t.movement_type IN ('regular','card_purchase')
         AND (%s::bigint IS NULL OR t.account_id=%s)
         ORDER BY t.date DESC,t.id DESC LIMIT 12""", (start, end, current, accountId, accountId))
     accounts = all_rows(db, """SELECT a.id,a.name,a.type,
         a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income' THEN t.amount_cents
         ELSE -t.amount_cents END),0) AS balance_cents
         FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id AND t.date <= %s
+        AND t.movement_type<>'card_purchase'
         WHERE (%s::bigint IS NULL OR a.id=%s) GROUP BY a.id ORDER BY balance_cents DESC""",
         (cutoff, accountId, accountId))
     bills = [item for item in bill_rows(db, current) if start <= item["due_date"] < end
         and (accountId is None or item["account_id"] == accountId)]
     incomes = [item for item in income_rows(db, current) if start <= item["due_date"] < end
         and (accountId is None or item["account_id"] == accountId)]
-    return jsonable_encoder({"month": start, "account_id": accountId, "totals": totals,
+    return jsonable_encoder({"mode": "actual", "month": start, "account_id": accountId, "totals": totals,
         "categories": categories, "days": days, "recent": recent, "accounts": accounts,
         "planned": {"bills_cents": sum(item["current_cents"] or 0 for item in bills if item["status"] != "paid"),
             "income_cents": sum(item["remaining_cents"] for item in incomes),
@@ -635,7 +853,7 @@ def account_details(account_id: int, month: str | None = None, offset: int = 0,
         a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income' THEN t.amount_cents
         ELSE -t.amount_cents END),0) AS balance_cents
         FROM accounts a LEFT JOIN yield_rates r ON r.id=a.yield_rate_id
-        LEFT JOIN transactions t ON t.account_id=a.id AND t.date<=%s
+        LEFT JOIN transactions t ON t.account_id=a.id AND t.date<=%s AND t.movement_type<>'card_purchase'
         WHERE a.id=%s GROUP BY a.id,r.id""", (current, account_id))
     if not account:
         fail(404, "Conta não encontrada.")
@@ -646,7 +864,7 @@ def account_details(account_id: int, month: str | None = None, offset: int = 0,
             py.transaction_id IS NOT NULL AS automatic_yield
         FROM transactions t JOIN accounts a ON a.id=t.account_id
         LEFT JOIN passive_yields py ON py.transaction_id=t.id
-        WHERE t.account_id=%s AND t.date<=%s)
+        WHERE t.account_id=%s AND t.date<=%s AND t.movement_type<>'card_purchase')
         SELECT o.*,COALESCE(c.name,o.category) AS category_name,s.name AS subcategory_name
         FROM ordered o LEFT JOIN categories c ON c.id=o.category_id
         LEFT JOIN subcategories s ON s.id=o.subcategory_id
@@ -654,16 +872,22 @@ def account_details(account_id: int, month: str | None = None, offset: int = 0,
         ORDER BY o.date DESC,o.id DESC LIMIT 50 OFFSET %s""",
         (account_id, current, start, start, end, end, offset))
     count = one(db, """SELECT COUNT(*)::bigint AS count FROM transactions WHERE account_id=%s AND date<=%s
-        AND (%s::date IS NULL OR date >= %s) AND (%s::date IS NULL OR date < %s)""",
+        AND movement_type<>'card_purchase' AND (%s::date IS NULL OR date >= %s) AND (%s::date IS NULL OR date < %s)""",
         (account_id, current, start, start, end, end))["count"]
     summary = one(db, """SELECT COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='income'),0)::bigint AS income_cents,
         COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='expense'),0)::bigint AS expense_cents,
         COALESCE(SUM(t.amount_cents) FILTER (WHERE py.transaction_id IS NOT NULL),0)::bigint AS yield_cents
         FROM transactions t LEFT JOIN passive_yields py ON py.transaction_id=t.id
-        WHERE t.account_id=%s AND t.date<=%s""", (account_id, current))
+        WHERE t.account_id=%s AND t.date<=%s AND t.movement_type<>'card_purchase'""", (account_id, current))
     projection = fixed_rate_projection(account["balance_cents"], account["annual_basis_points"],
         account["yield_multiplier_basis_points"], current)
+    cards = [card for card in card_rows(db, current) if card["payment_account_id"] == account_id]
+    card_purchases = all_rows(db, """SELECT p.*,cc.name AS card_name FROM card_purchases p
+        JOIN credit_cards cc ON cc.id=p.credit_card_id WHERE cc.payment_account_id=%s
+        AND (%s::date IS NULL OR p.purchase_date >= %s) AND (%s::date IS NULL OR p.purchase_date < %s)
+        ORDER BY p.purchase_date DESC,p.id DESC LIMIT 50""", (account_id, start, start, end, end))
     return jsonable_encoder({"account": account, "history": history, "history_count": count,
+        "cards": cards, "card_purchases": card_purchases,
         "summary": summary, "projection": projection, "today": current, "month": start, "offset": offset})
 
 
@@ -757,6 +981,9 @@ def edit_account(account_id: int, value: dict, who=Depends(mutation), db=Depends
 def delete_account(account_id: int, who=Depends(mutation), db=Depends(db_session)):
     if one(db, "SELECT id FROM transactions WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM bills WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM planned_incomes WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT 1 FROM passive_yields WHERE account_id=%s LIMIT 1", (account_id,)):
         fail(409, "Esta conta possui despesas, entradas ou lançamentos.")
+    if one(db, "SELECT id FROM credit_cards WHERE payment_account_id=%s OR collateral_account_id=%s LIMIT 1",
+           (account_id, account_id)):
+        fail(409, "Esta conta está ligada a um cartão de crédito.")
     if not one(db, "DELETE FROM accounts WHERE id=%s RETURNING id", (account_id,)):
         fail(404, "Conta não encontrada.")
     return {"ok": True}
@@ -845,7 +1072,9 @@ def bill_values(db, value: dict):
         fail(400, "Tipo de despesa inválido.")
     return (account_id, text(value.get("description"), "Nome da despesa"), category_name,
         category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"),
-        parsed_date(value.get("dueDate")), interest(value.get("interestRateBasisPoints"), period), period, expense_type)
+        parsed_date(value.get("dueDate")),
+        interest(value.get("interestRateBasisPoints"), value.get("interestRatePeriod") or period),
+        interest_period(period), expense_type)
 
 
 def income_values(db, value: dict):
@@ -968,9 +1197,11 @@ def delete_income_receipt(income_id: int, receipt_id: int, who=Depends(mutation)
 @app.post("/api/bills", status_code=201)
 def create_bill(value: dict, who=Depends(mutation), db=Depends(db_session)):
     fields = bill_values(db, value)
+    extras = bill_extras(value)
     result = one(db, """INSERT INTO bills(account_id,description,category,category_id,subcategory_id,note,
-        amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,recurrence_active)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""", (*fields, fields[-1] == "fixed"))
+        amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,recurrence_active,payment_method,
+        interest_rate_period,fine_basis_points,fine_after)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""", (*fields, fields[-1] == "fixed", *extras))
     return {"id": result["id"]}
 
 
@@ -981,14 +1212,18 @@ def edit_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_se
     existing = one(db, "SELECT * FROM bills WHERE id=%s AND archived=FALSE FOR UPDATE", (bill_id,))
     if not existing:
         fail(404, "Despesa não encontrada.")
+    if existing["credit_card_id"]:
+        fail(409, "A fatura é gerenciada pelo cartão.")
     fields = bill_values(db, value)
+    extras = bill_extras(value)
     if existing["recurrence_origin_id"] and fields[-1] != "fixed":
         fail(400, "Uma parcela mensal permanece fixa. Exclua esta parcela se não for necessária.")
     if not one(db, """UPDATE bills SET account_id=%s,description=%s,category=%s,category_id=%s,
         subcategory_id=%s,note=%s,amount_cents=%s,due_date=%s,interest_rate_basis_points=%s,
-        interest_period=%s,expense_type=%s,recurrence_active=%s WHERE id=%s RETURNING id""",
+        interest_period=%s,expense_type=%s,recurrence_active=%s,payment_method=%s,interest_rate_period=%s,
+        fine_basis_points=%s,fine_after=%s WHERE id=%s RETURNING id""",
         (*fields, fields[-1] == "fixed" and existing["recurrence_origin_id"] is None
-         and (existing["expense_type"] != "fixed" or existing["recurrence_active"]), bill_id)):
+         and (existing["expense_type"] != "fixed" or existing["recurrence_active"]), *extras, bill_id)):
         fail(404, "Despesa não encontrada.")
     if existing["recurrence_origin_id"] is None and existing["expense_type"] == "fixed" and fields[-1] == "eventual":
         db.execute("""UPDATE bills SET archived=TRUE WHERE recurrence_origin_id=%s AND due_date >= %s
@@ -1006,7 +1241,8 @@ def edit_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_se
                 continue
             db.execute("""UPDATE bills SET account_id=%s,description=%s,category=%s,category_id=%s,
                 subcategory_id=%s,note=%s,amount_cents=%s,due_date=%s,interest_rate_basis_points=%s,
-                interest_period=%s,archived=FALSE WHERE id=%s""", (*fields[:7], add_months(fields[7], offset), *fields[8:10], child["id"]))
+                interest_period=%s,payment_method=%s,interest_rate_period=%s,fine_basis_points=%s,fine_after=%s,
+                archived=FALSE WHERE id=%s""", (*fields[:7], add_months(fields[7], offset), *fields[8:10], *extras, child["id"]))
     return {"ok": True}
 
 
@@ -1017,6 +1253,8 @@ def delete_bill(bill_id: int, who=Depends(mutation), db=Depends(db_session)):
     existing = one(db, "SELECT * FROM bills WHERE id=%s AND archived=FALSE", (bill_id,))
     if not existing:
         fail(404, "Despesa não encontrada.")
+    if existing["credit_card_id"]:
+        fail(409, "A fatura é gerenciada pelo cartão.")
     if existing["expense_type"] == "fixed":
         db.execute("UPDATE bills SET archived=TRUE,recurrence_active=FALSE WHERE id=%s", (bill_id,))
         if existing["recurrence_origin_id"] is None:
@@ -1051,6 +1289,8 @@ def edit_bill_note(bill_id: int, value: dict, who=Depends(mutation), db=Depends(
 
 @app.patch("/api/bills/{bill_id}/classification")
 def classify_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    if one(db, "SELECT id FROM bills WHERE id=%s AND credit_card_id IS NOT NULL", (bill_id,)):
+        fail(409, "A fatura é gerenciada pelo cartão.")
     category_id, subcategory_id, category_name = category_choice(db, value, "expense")
     if not one(db, "UPDATE bills SET category=%s,category_id=%s,subcategory_id=%s WHERE id=%s RETURNING id",
         (category_name, category_id, subcategory_id, bill_id)):
@@ -1062,14 +1302,16 @@ def classify_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(d
 
 @app.patch("/api/bills/{bill_id}/interest")
 def edit_bill_interest(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
-    period = value.get("interestPeriod")
-    rate = interest(value.get("interestRateBasisPoints"), period)
+    period = interest_period(value.get("interestPeriod"))
+    _, rate_period, fine, fine_after = bill_extras(value)
+    rate = interest(value.get("interestRateBasisPoints"), rate_period)
     bill = next((b for b in bill_rows(db, today(os.getenv("APP_TIMEZONE", "America/Araguaina"))) if b["id"] == bill_id), None)
     if not bill:
         fail(404, "Despesa não encontrada.")
     if bill["status"] == "paid":
         fail(409, "Uma despesa quitada não pode ter juros alterados.")
-    db.execute("UPDATE bills SET interest_rate_basis_points=%s,interest_period=%s WHERE id=%s", (rate, period, bill_id))
+    db.execute("""UPDATE bills SET interest_rate_basis_points=%s,interest_period=%s,interest_rate_period=%s,
+        fine_basis_points=%s,fine_after=%s WHERE id=%s""", (rate, period, rate_period, fine, fine_after, bill_id))
     return {"ok": True}
 
 
@@ -1080,11 +1322,14 @@ def pay_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_ses
         fail(400, "Registre o pagamento na data em que ele acontecer.")
     amount = integer(value.get("amountCents"), "Valor do pagamento")
     account_id = integer(value.get("accountId"), "Conta")
+    method = payment_method(value.get("paymentMethod", "pix"))
     bill = one(db, "SELECT * FROM bills WHERE id=%s FOR UPDATE", (bill_id,))
     if not bill:
         fail(404, "Despesa não encontrada.")
     if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
         fail(400, "Conta inválida.")
+    if bill["credit_card_id"] and method == "credit":
+        fail(400, "Pague a fatura com Pix ou débito.")
     payments = all_rows(db, "SELECT id,amount_cents,date FROM transactions WHERE bill_id=%s ORDER BY date,id", (bill_id,))
     if payments and when < payments[-1]["date"]:
         fail(400, "A data deve ser igual ou posterior ao último pagamento.")
@@ -1095,17 +1340,36 @@ def pay_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_ses
         fail(409, "Esta despesa já está paga.")
     if amount > outstanding:
         fail(400, "Pagamento acima do saldo devido.")
+    if method == "credit":
+        card = card_for_account(db, value.get("creditCardId"), account_id)
+        installments = integer(value.get("installments", 1), "Parcelas", 1, 48)
+        purchase_id = create_card_purchase(db, card, f"Pagamento: {bill['description']}",
+            (bill["category"], bill["category_id"], bill["subcategory_id"]), note(value.get("note")),
+            amount, when, installments, bill_id)
+        return {"id": purchase_id}
     result = one(db, """INSERT INTO transactions(account_id,bill_id,kind,description,category,category_id,
-        subcategory_id,note,amount_cents,date) VALUES(%s,%s,'expense',%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-        (account_id, bill_id, f"Pagamento: {bill['description']}", bill["category"], bill["category_id"], bill["subcategory_id"], note(value.get("note")), amount, when))
+        subcategory_id,note,amount_cents,date,payment_method,movement_type)
+        VALUES(%s,%s,'expense',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (account_id, bill_id, f"Pagamento: {bill['description']}", bill["category"], bill["category_id"],
+         bill["subcategory_id"], note(value.get("note")), amount, when, method,
+         "invoice_payment" if bill["credit_card_id"] else "regular"))
     return {"id": result["id"]}
 
 
 @app.delete("/api/bills/{bill_id}/payments/{payment_id}")
 def delete_payment(bill_id: int, payment_id: int, who=Depends(mutation), db=Depends(db_session)):
-    if not one(db, "DELETE FROM transactions WHERE bill_id=%s AND id=%s RETURNING id", (bill_id, payment_id)):
+    payment = one(db, "SELECT id,card_purchase_id FROM transactions WHERE bill_id=%s AND id=%s", (bill_id, payment_id))
+    if not payment:
         fail(404, "Pagamento não encontrado.")
+    if payment["card_purchase_id"]:
+        remove_card_purchase(db, payment["card_purchase_id"])
+    else:
+        db.execute("DELETE FROM transactions WHERE id=%s", (payment_id,))
     return {"ok": True}
+
+
+def expense_method(value: dict, transaction_kind: str) -> str | None:
+    return payment_method(value.get("paymentMethod", "pix")) if transaction_kind == "expense" else None
 
 
 @app.post("/api/transactions", status_code=201)
@@ -1114,20 +1378,29 @@ def create_transaction(value: dict, who=Depends(mutation), db=Depends(db_session
     if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
         fail(400, "Conta inválida.")
     transaction_kind = kind(value.get("kind"))
+    method = expense_method(value, transaction_kind)
     category_id, subcategory_id, category_name = category_choice(db, value, transaction_kind)
     when = parsed_date(value.get("date"))
     if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
         fail(400, "Lançamentos imediatos não podem ter data futura. Use Despesas para contas a vencer.")
+    description = text(value.get("description"), "Nome do lançamento")
+    amount = integer(value.get("amountCents"), "Valor")
+    if method == "credit":
+        card = card_for_account(db, value.get("creditCardId"), account_id)
+        installments = integer(value.get("installments", 1), "Parcelas", 1, 48)
+        return {"id": create_card_purchase(db, card, description, (category_name, category_id, subcategory_id),
+            note(value.get("note")), amount, when, installments)}
     result = one(db, """INSERT INTO transactions(account_id,kind,description,category,category_id,
-        subcategory_id,note,amount_cents,date) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-        (account_id, transaction_kind, text(value.get("description"), "Nome do lançamento"), category_name,
-        category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"), when))
+        subcategory_id,note,amount_cents,date,payment_method) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (account_id, transaction_kind, description, category_name, category_id, subcategory_id,
+         note(value.get("note")), amount, when, method))
     return {"id": result["id"]}
 
 
 @app.patch("/api/transactions/{transaction_id}")
 def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
-    existing = one(db, "SELECT kind,bill_id,planned_income_id FROM transactions WHERE id=%s", (transaction_id,))
+    existing = one(db, "SELECT kind,bill_id,planned_income_id,movement_type,card_purchase_id FROM transactions WHERE id=%s",
+        (transaction_id,))
     if not existing:
         fail(404, "Lançamento não encontrado.")
     if existing["bill_id"]:
@@ -1136,31 +1409,172 @@ def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db
         fail(409, "Exclua o recebimento na entrada correspondente.")
     if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
         fail(409, "Rendimentos automáticos não podem ser editados.")
+    if existing["movement_type"] == "transfer":
+        fail(409, "Exclua o aporte ou resgate e registre novamente.")
+    if existing["card_purchase_id"]:
+        # Amount, date and card define the invoices; only the description and classification change here.
+        category_id, subcategory_id, category_name = category_choice(db, value, "expense")
+        description = text(value.get("description"), "Nome do lançamento")
+        purchase = one(db, "UPDATE card_purchases SET description=%s WHERE id=%s RETURNING installments",
+            (description, existing["card_purchase_id"]))
+        db.execute("""UPDATE transactions SET description=CASE WHEN %s > 1
+            THEN %s || ' (' || installment_number || '/' || %s || ')' ELSE %s END,
+            category=%s,category_id=%s,subcategory_id=%s,note=%s WHERE card_purchase_id=%s""",
+            (purchase["installments"], description, purchase["installments"], description, category_name,
+             category_id, subcategory_id, note(value.get("note")), existing["card_purchase_id"]))
+        return {"ok": True}
     account_id = integer(value.get("accountId"), "Conta")
     if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
         fail(400, "Conta inválida.")
     transaction_kind = kind(value.get("kind"))
+    method = expense_method(value, transaction_kind)
+    if method == "credit":
+        fail(400, "Para lançar no crédito, exclua este lançamento e registre a compra no cartão.")
     category_id, subcategory_id, category_name = category_choice(db, value, transaction_kind)
     when = parsed_date(value.get("date"))
     if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
         fail(400, "Lançamentos imediatos não podem ter data futura.")
     db.execute("""UPDATE transactions SET account_id=%s,kind=%s,description=%s,category=%s,
-        category_id=%s,subcategory_id=%s,note=%s,amount_cents=%s,date=%s WHERE id=%s""",
+        category_id=%s,subcategory_id=%s,note=%s,amount_cents=%s,date=%s,payment_method=%s WHERE id=%s""",
         (account_id, transaction_kind, text(value.get("description"), "Nome do lançamento"), category_name,
-        category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"), when, transaction_id))
+        category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"), when,
+        method, transaction_id))
     return {"ok": True}
 
 
 @app.delete("/api/transactions/{transaction_id}")
 def delete_transaction(transaction_id: int, who=Depends(mutation), db=Depends(db_session)):
-    if one(db, "SELECT id FROM transactions WHERE id=%s AND bill_id IS NOT NULL", (transaction_id,)):
+    existing = one(db, "SELECT * FROM transactions WHERE id=%s", (transaction_id,))
+    if not existing:
+        fail(404, "Lançamento não encontrado.")
+    if existing["bill_id"]:
         fail(409, "Exclua o pagamento na despesa correspondente.")
-    if one(db, "SELECT id FROM transactions WHERE id=%s AND planned_income_id IS NOT NULL", (transaction_id,)):
+    if existing["planned_income_id"]:
         fail(409, "Exclua o recebimento na entrada correspondente.")
     if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
         fail(409, "Rendimentos automáticos não podem ser excluídos.")
-    if not one(db, "DELETE FROM transactions WHERE id=%s RETURNING id", (transaction_id,)):
-        fail(404, "Lançamento não encontrado.")
+    if existing["card_purchase_id"]:
+        remove_card_purchase(db, existing["card_purchase_id"])
+        return {"ok": True}
+    if existing["transfer_group"]:
+        accounts = [row["account_id"] for row in all_rows(db,
+            "DELETE FROM transactions WHERE transfer_group=%s RETURNING account_id", (existing["transfer_group"],))]
+        for card in all_rows(db, "SELECT * FROM credit_cards WHERE collateral_account_id = ANY(%s) FOR UPDATE", (accounts,)):
+            if card_limits(db, card, today(os.getenv("APP_TIMEZONE", "America/Araguaina")))["available_cents"] < 0:
+                fail(409, "Excluir este aporte deixaria o limite do cartão abaixo do valor já usado.")
+        return {"ok": True}
+    db.execute("DELETE FROM transactions WHERE id=%s", (transaction_id,))
+    return {"ok": True}
+
+
+def card_values(db, value: dict) -> tuple:
+    account_id = integer(value.get("paymentAccountId"), "Conta do cartão")
+    if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
+        fail(400, "Conta inválida.")
+    if one(db, "SELECT id FROM credit_cards WHERE collateral_account_id=%s", (account_id,)):
+        fail(400, "A conta de limite garantido não pode pagar um cartão.")
+    return (text(value.get("name"), "Nome do cartão", 80), account_id,
+        integer(value.get("baseLimitCents", 0), "Limite", 0),
+        integer(value.get("closingDay"), "Dia de fechamento", 1, 31),
+        integer(value.get("dueDay"), "Dia de vencimento", 1, 31),
+        integer(value.get("lateInterestBasisPoints", 0), "Juros da fatura", 0, 10000), note(value.get("note")))
+
+
+@app.post("/api/cards", status_code=201)
+def create_card(value: dict, who=Depends(mutation), db=Depends(db_session)):
+    name, account_id, base_limit, closing, due, late_interest, card_note = card_values(db, value)
+    rate_id, multiplier = account_yield_choice(db, value)
+    collateral = one(db, """INSERT INTO accounts(name,type,opening_cents,note,yield_rate_id,
+        yield_multiplier_basis_points,yield_start_date) VALUES(%s,'Limite garantido',0,%s,%s,%s,%s) RETURNING id""",
+        (f"Limite garantido · {name}"[:120], f"Garantia do cartão {name}", rate_id, multiplier,
+         yield_start(yield_clock()) if rate_id else None))
+    result = one(db, """INSERT INTO credit_cards(name,payment_account_id,collateral_account_id,base_limit_cents,
+        closing_day,due_day,late_interest_basis_points,note) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (name, account_id, collateral["id"], base_limit, closing, due, late_interest, card_note))
+    return {"id": result["id"]}
+
+
+@app.patch("/api/cards/{card_id}")
+def edit_card(card_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    sync_dynamic_rates(db, yield_clock().date())
+    accrue_passive_yields(db)
+    card = one(db, "SELECT * FROM credit_cards WHERE id=%s FOR UPDATE", (card_id,))
+    if not card:
+        fail(404, "Cartão não encontrado.")
+    name, account_id, base_limit, closing, due, late_interest, card_note = card_values(db, value)
+    has_purchases = one(db, "SELECT id FROM card_purchases WHERE credit_card_id=%s LIMIT 1", (card_id,))
+    if has_purchases and (account_id, closing, due) != (card["payment_account_id"], card["closing_day"], card["due_day"]):
+        fail(409, "Conta, fechamento e vencimento não podem mudar depois das primeiras compras.")
+    db.execute("""UPDATE credit_cards SET name=%s,payment_account_id=%s,base_limit_cents=%s,closing_day=%s,
+        due_day=%s,late_interest_basis_points=%s,note=%s WHERE id=%s""",
+        (name, account_id, base_limit, closing, due, late_interest, card_note, card_id))
+    db.execute("""UPDATE bills SET interest_rate_basis_points=%s WHERE credit_card_id=%s
+        AND NOT EXISTS (SELECT 1 FROM transactions WHERE bill_id=bills.id)""", (late_interest, card_id))
+    collateral = one(db, "SELECT * FROM accounts WHERE id=%s FOR UPDATE", (card["collateral_account_id"],))
+    rate_id, multiplier = account_yield_choice(db, value)
+    changed = rate_id != collateral["yield_rate_id"] or multiplier != collateral["yield_multiplier_basis_points"]
+    start = yield_start(yield_clock()) if rate_id and changed else collateral["yield_start_date"] if rate_id else None
+    db.execute("""UPDATE accounts SET name=%s,yield_rate_id=%s,yield_multiplier_basis_points=%s,yield_start_date=%s
+        WHERE id=%s""", (f"Limite garantido · {name}"[:120], rate_id, multiplier, start, collateral["id"]))
+    if card_limits(db, {**card, "base_limit_cents": base_limit}, today(os.getenv("APP_TIMEZONE", "America/Araguaina")))["available_cents"] < 0:
+        fail(409, "O novo limite fica abaixo do valor já usado no cartão.")
+    return {"ok": True}
+
+
+@app.delete("/api/cards/{card_id}")
+def delete_card(card_id: int, who=Depends(mutation), db=Depends(db_session)):
+    card = one(db, "SELECT * FROM credit_cards WHERE id=%s FOR UPDATE", (card_id,))
+    if not card:
+        fail(404, "Cartão não encontrado.")
+    if one(db, "SELECT id FROM card_purchases WHERE credit_card_id=%s LIMIT 1", (card_id,)):
+        fail(409, "Este cartão possui compras.")
+    if one(db, "SELECT id FROM transactions WHERE account_id=%s LIMIT 1", (card["collateral_account_id"],)):
+        fail(409, "Resgate o limite garantido e exclua os aportes antes de excluir o cartão.")
+    db.execute("DELETE FROM bills WHERE credit_card_id=%s", (card_id,))
+    db.execute("DELETE FROM credit_cards WHERE id=%s", (card_id,))
+    db.execute("DELETE FROM passive_yields WHERE account_id=%s", (card["collateral_account_id"],))
+    db.execute("DELETE FROM accounts WHERE id=%s", (card["collateral_account_id"],))
+    return {"ok": True}
+
+
+@app.post("/api/cards/{card_id}/collateral", status_code=201)
+def move_collateral(card_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    card = one(db, "SELECT * FROM credit_cards WHERE id=%s FOR UPDATE", (card_id,))
+    if not card:
+        fail(404, "Cartão não encontrado.")
+    direction = value.get("direction")
+    if direction not in ("deposit", "withdraw"):
+        fail(400, "Movimento inválido.")
+    account_id = integer(value.get("accountId"), "Conta")
+    if account_id == card["collateral_account_id"] or not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)) \
+            or one(db, "SELECT id FROM credit_cards WHERE collateral_account_id=%s", (account_id,)):
+        fail(400, "Conta inválida.")
+    amount = integer(value.get("amountCents"), "Valor")
+    when = parsed_date(value.get("date"))
+    if when > current:
+        fail(400, "Registre o movimento na data em que ele acontecer.")
+    limits = card_limits(db, card, current)
+    if direction == "withdraw":
+        if amount > limits["collateral_cents"]:
+            fail(400, "Resgate acima do saldo do limite garantido.")
+        if amount > limits["available_cents"]:
+            fail(409, "O resgate deixaria o limite abaixo do valor já usado no cartão.")
+    group = one(db, "SELECT nextval('transfer_group_seq') AS id")["id"]
+    label = "Aporte no limite garantido" if direction == "deposit" else "Resgate do limite garantido"
+    source, target = (account_id, card["collateral_account_id"]) if direction == "deposit" else (card["collateral_account_id"], account_id)
+    for account, movement in ((source, "expense"), (target, "income")):
+        db.execute("""INSERT INTO transactions(account_id,kind,description,category,note,amount_cents,date,
+            movement_type,transfer_group) VALUES(%s,%s,%s,'Transferência',%s,%s,%s,'transfer',%s)""",
+            (account, movement, f"{label}: {card['name']}", note(value.get("note")), amount, when, group))
+    return {"ok": True}
+
+
+@app.delete("/api/card-purchases/{purchase_id}")
+def delete_card_purchase(purchase_id: int, who=Depends(mutation), db=Depends(db_session)):
+    if one(db, "SELECT id FROM transactions WHERE card_purchase_id=%s AND bill_id IS NOT NULL LIMIT 1", (purchase_id,)):
+        fail(409, "Exclua o pagamento na despesa correspondente.")
+    remove_card_purchase(db, purchase_id)
     return {"ok": True}
 
 
