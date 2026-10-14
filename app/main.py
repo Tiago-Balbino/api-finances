@@ -1154,13 +1154,15 @@ def run_simulation(db, current: date) -> tuple[dict, dict]:
         for origin, due in recurrence_state(db, "planned_incomes", "income_type", current, SIMULATION_MONTHS)]
     result = simulate_payoff(balance, bills, incomes, current, SIMULATION_MONTHS)
     month_end = add_months(current.replace(day=1), 1) - timedelta(days=1)
-    year_end = add_months(current.replace(day=1), 12) - timedelta(days=1)
     overdue = [item for item in bills if item["due_date"] < current]
     this_month = [item for item in bills if current <= item["due_date"] <= month_end]
     need_today = sum(item["current_cents"] or 0 for item in overdue + this_month)
-    bills_year = sum(item["current_cents"] or 0 for item in bills if item["due_date"] <= year_end)
-    incomes_year = sum(item["amount_cents"] for item in incomes if item["due_date"] <= year_end)
-    year_gap = bills_year - incomes_year - balance
+    # The 12-month view comes from the simulation itself, so it includes the interest it projects.
+    year = result["timeline"][11]
+    year_paid = sum(month["paid_cents"] for month in result["timeline"][:12])
+    year_income = sum(month["income_cents"] for month in result["timeline"][:12])
+    year_bills = year_paid + year["debt_cents"]
+    year_gap = year_bills - balance - year_income
     summary = {"generated_on": current, "balance_cents": balance,
         "overdue_cents": sum(item["current_cents"] or 0 for item in overdue), "overdue_count": len(overdue),
         "this_month_cents": sum(item["current_cents"] or 0 for item in this_month), "this_month_count": len(this_month),
@@ -1168,7 +1170,9 @@ def run_simulation(db, current: date) -> tuple[dict, dict]:
         "payoff_date": result["payoff_date"], "months_to_payoff": result["months_to_payoff"],
         "interest_cents": result["interest_cents"], "total_paid_cents": result["total_paid_cents"],
         "unpaid_at_horizon_cents": result["unpaid_at_horizon_cents"], "horizon_months": SIMULATION_MONTHS,
-        "year_bills_cents": bills_year, "year_incomes_cents": incomes_year, "year_gap_cents": year_gap,
+        "year_end": add_months(current.replace(day=1), 12) - timedelta(days=1),
+        "year_bills_cents": year_bills, "year_incomes_cents": year_income, "year_gap_cents": year_gap,
+        "year_debt_cents": year["debt_cents"], "year_cash_cents": year["closing_cash_cents"],
         "monthly_extra_needed_cents": -(-max(0, year_gap) // 12)}
     return summary, result
 

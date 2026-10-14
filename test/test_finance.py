@@ -1,5 +1,5 @@
 import unittest
-from datetime import date
+from datetime import date, timedelta
 
 from app.finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, payments_fit,
                          projected_cents, simulate_payoff, split_installments)
@@ -112,6 +112,49 @@ class FinanceTests(unittest.TestCase):
         self.assertTrue(payments_fit(bill, [later, early]))  # dates out of order are fine
         self.assertFalse(payments_fit(bill, [early, {**later, "amount_cents": 6001}]))
         self.assertFalse(payments_fit({**bill, "amount_cents": 5000}, [early, later]))  # invoice reduced below what was paid
+
+    def assert_reconciles(self, balance, bills, today, result):
+        """Cash and debt must close every month, to the cent."""
+        opening = balance
+        previous_debt = 0
+        for month in result["timeline"]:
+            start = month["month"]
+            end = add_months(start, 1) - timedelta(days=1)
+            self.assertEqual(month["opening_cash_cents"], opening)
+            self.assertEqual(month["closing_cash_cents"], opening + month["income_cents"] - month["paid_cents"])
+            self.assertGreaterEqual(month["closing_cash_cents"], 0)
+            self.assertEqual(month["paid_cents"], sum(item["amount_cents"] for item in month["payments"]))
+            new = sum(debt_cents_at(bill, bill["payments"], max(today, bill["due_date"]))
+                for bill in bills if (bill["due_date"] <= end if start <= today else start <= bill["due_date"] <= end))
+            interest = month["debt_cents"] - previous_debt - new + month["paid_cents"]
+            self.assertGreaterEqual(interest, 0, f"juros negativos em {start}")
+            previous_debt, opening = month["debt_cents"], month["closing_cash_cents"]
+        self.assertEqual(result["total_paid_cents"] + result["unpaid_at_horizon_cents"],
+            result["debt_today_cents"] + result["interest_cents"])
+
+    def test_simulation_reconciles_cash_and_debt_every_month(self):
+        today = date(2026, 10, 14)
+        bills = [self.debt(1, date(2026, 8, 10), 1500000, rate=400), self.debt(2, date(2026, 10, 14), 30000, rate=200),
+                 self.debt(3, date(2026, 11, 12), 10000, rate=1000), self.debt(4, date(2027, 1, 20), 45000)]
+        bills[0].update(interest_period="daily", interest_rate_period="monthly", fine_basis_points=200, fine_after="day")
+        incomes = [{"due_date": add_months(date(2026, 11, 5), i), "amount_cents": 250000, "description": "Salário"} for i in range(24)]
+        result = simulate_payoff(395000, bills, incomes, today, months=24)
+        self.assert_reconciles(395000, bills, today, result)
+        self.assertEqual(result["total_income_cents"], 23 * 250000)  # out/2028 fica fora do horizonte de 24 meses
+        self.assertEqual(result["cash_left_cents"], 395000 + 23 * 250000 - result["total_paid_cents"])
+
+    def test_bills_due_before_next_income_are_paid_on_time(self):
+        today = date(2026, 10, 14)
+        loan = self.debt(1, date(2026, 8, 10), 1000000, rate=400)
+        invoice = self.debt(2, date(2026, 11, 12), 10000, rate=1000)
+        incomes = [{"due_date": date(2026, 11, 5), "amount_cents": 250000, "description": "Salário"},
+                   {"due_date": date(2026, 12, 5), "amount_cents": 250000, "description": "Salário"}]
+        result = simulate_payoff(0, [loan, invoice], incomes, today, months=12)
+        november = result["timeline"][1]["payments"]
+        self.assertEqual([(item["description"], item["amount_cents"]) for item in november],
+                         [("D1", 240000), ("D2", 10000)])  # R$ 100 guardados para a fatura de 12/11
+        self.assertFalse(november[1]["late"])
+        self.assert_reconciles(0, [loan, invoice], today, result)
 
 
 if __name__ == "__main__":

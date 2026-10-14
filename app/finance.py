@@ -138,11 +138,13 @@ def monthly_rate(bill: dict) -> float:
 
 
 def simulate_payoff(balance: int, bills: list[dict], incomes: list[dict], today: date, months: int = 60) -> dict:
-    """Spend every incoming cent on debts, day by day, until everything is paid.
+    """Spend every incoming cent on bills, day by day, until everything is paid.
 
     bills: open bills with payments (real or projected). incomes: {"due_date", "amount_cents", "description"}
-    still to be received; overdue ones are assumed to arrive today. Each date, money goes first to the
-    bills already due with the highest interest (ties: oldest). Interest and fines keep running on late bills."""
+    still to be received; overdue ones are assumed to arrive today. On each date money goes, in order, to:
+    1. bills due that day; 2. a reserve for bills due before the next income, so they are paid on time;
+    3. what is left goes to late bills, highest interest first (ties: oldest). Interest and fines keep
+    running on late bills. Every month satisfies: opening cash + income - paid = closing cash."""
     first_month = today.replace(day=1)
     horizon = add_months(first_month, months) - timedelta(days=1)
     debts = []
@@ -154,6 +156,7 @@ def simulate_payoff(balance: int, bills: list[dict], incomes: list[dict], today:
     for income in incomes:
         if income["amount_cents"] > 0 and income["due_date"] <= horizon:
             arrivals.setdefault(max(today, income["due_date"]), []).append(income)
+    income_dates = sorted(arrivals)
     events = sorted({today} | set(arrivals) | {debt["bill"]["due_date"] for debt in debts if debt["bill"]["due_date"] > today})
     rows: dict[date, dict] = {}
     cash, sequence = balance, 0
@@ -161,22 +164,31 @@ def simulate_payoff(balance: int, bills: list[dict], incomes: list[dict], today:
     def row(when: date) -> dict:
         return rows.setdefault(when.replace(day=1), {"income_cents": 0, "paid_cents": 0, "payments": []})
 
+    def value(debt: dict, when: date) -> int:
+        return debt_cents_at(debt["bill"], debt["payments"], when) or 0
+
     for when in events:
         for income in arrivals.get(when, []):
             cash += income["amount_cents"]
             row(when)["income_cents"] += income["amount_cents"]
-        due = [debt for debt in debts if debt["settled"] is None and debt["bill"]["due_date"] <= when]
-        due.sort(key=lambda debt: (-monthly_rate(debt["bill"]), debt["bill"]["due_date"], str(debt["bill"]["id"])))
-        for debt in due:
-            if cash <= 0:
-                break
-            value = debt_cents_at(debt["bill"], debt["payments"], when) or 0
-            amount = min(cash, value)
+        open_debts = [debt for debt in debts if debt["settled"] is None]
+        next_income = next((item for item in income_dates if item > when), horizon + timedelta(days=1))
+        reserve = sum(value(debt, debt["bill"]["due_date"]) for debt in open_debts
+            if when < debt["bill"]["due_date"] < next_income)
+        due_today = [debt for debt in open_debts if debt["bill"]["due_date"] == when]
+        late = sorted((debt for debt in open_debts if debt["bill"]["due_date"] < when),
+            key=lambda debt: (-monthly_rate(debt["bill"]), debt["bill"]["due_date"], str(debt["bill"]["id"])))
+        for debt in due_today + late:
+            limit = cash if debt in due_today else cash - reserve
+            if limit <= 0:
+                continue
+            owed = value(debt, when)
+            amount = min(limit, owed)
             sequence += 1
             debt["payments"].append({"id": 10**12 + sequence, "date": when, "amount_cents": amount})
             debt["paid"] += amount
             cash -= amount
-            settled = amount == value
+            settled = amount == owed
             if settled:
                 debt["settled"] = when
             month = row(when)
@@ -185,24 +197,28 @@ def simulate_payoff(balance: int, bills: list[dict], incomes: list[dict], today:
                 "amount_cents": amount, "settled": settled, "late": when > debt["bill"]["due_date"],
                 "due_date": debt["bill"]["due_date"]})
 
-    late = [debt for debt in debts if debt["settled"] is None or debt["settled"] > debt["bill"]["due_date"]]
+    late_debts = [debt for debt in debts if debt["settled"] is None or debt["settled"] > debt["bill"]["due_date"]]
     unpaid = [debt for debt in debts if debt["settled"] is None]
-    payoff = None if unpaid else max((debt["settled"] for debt in late), default=today)
+    payoff = None if unpaid else max((debt["settled"] for debt in late_debts), default=today)
     months_to_payoff = None if payoff is None else (payoff.year - today.year) * 12 + payoff.month - today.month
     last_month = horizon.replace(day=1) if payoff is None else max(payoff.replace(day=1), add_months(first_month, 11))
-    timeline, cursor = [], first_month
-    while cursor <= last_month:
+    timeline, cursor, opening = [], first_month, balance
+    while cursor <= horizon.replace(day=1):
         end = add_months(cursor, 1) - timedelta(days=1)
-        open_debts = [debt for debt in debts if debt["bill"]["due_date"] <= end]
         month = rows.get(cursor, {"income_cents": 0, "paid_cents": 0, "payments": []})
-        timeline.append({"month": cursor, **month,
-            "debt_cents": sum(debt_cents_at(debt["bill"], debt["payments"], end) or 0 for debt in open_debts),
-            "overdue_cents": sum(debt_cents_at(debt["bill"], debt["payments"], end) or 0 for debt in open_debts
-                if debt["bill"]["due_date"] < end)})
+        closing = opening + month["income_cents"] - month["paid_cents"]
+        if cursor <= last_month:
+            open_debts = [debt for debt in debts if debt["bill"]["due_date"] <= end]
+            timeline.append({"month": cursor, "opening_cash_cents": opening, **month, "closing_cash_cents": closing,
+                "debt_cents": sum(value(debt, end) for debt in open_debts),
+                "overdue_cents": sum(value(debt, end) for debt in open_debts if debt["bill"]["due_date"] < end)})
+        opening = closing
         cursor = add_months(cursor, 1)
-    leftover = sum(debt_cents_at(debt["bill"], debt["payments"], horizon) or 0 for debt in unpaid)
+    leftover = sum(value(debt, horizon) for debt in unpaid)
     return {"payoff_date": payoff, "months_to_payoff": months_to_payoff, "horizon_months": months,
+        "opening_cash_cents": balance, "total_income_cents": sum(row["income_cents"] for row in rows.values()),
         "total_paid_cents": sum(debt["paid"] for debt in debts),
+        "debt_today_cents": sum(debt["base"] for debt in debts),
         "interest_cents": sum(debt["paid"] for debt in debts) + leftover - sum(debt["base"] for debt in debts),
         "unpaid_at_horizon_cents": leftover, "unpaid_count": len(unpaid), "cash_left_cents": cash,
         "timeline": timeline}
