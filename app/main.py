@@ -185,10 +185,12 @@ def admin(result):
 
 
 def bill_rows(db, as_of: date):
-    bills = all_rows(db, """SELECT b.*,c.name AS category_name,s.name AS subcategory_name,a.name AS account_name
+    bills = all_rows(db, """SELECT b.*,origin.recurrence_active AS series_active,
+        c.name AS category_name,s.name AS subcategory_name,a.name AS account_name
         FROM bills b JOIN accounts a ON a.id=b.account_id
+        LEFT JOIN bills origin ON origin.id=COALESCE(b.recurrence_origin_id,b.id)
         LEFT JOIN categories c ON c.id=b.category_id LEFT JOIN subcategories s ON s.id=b.subcategory_id
-        ORDER BY b.due_date,b.id""")
+        WHERE b.archived=FALSE ORDER BY b.due_date,b.id""")
     payments = all_rows(db, """SELECT t.id,t.bill_id,t.account_id,t.amount_cents,t.date,t.note,a.name AS account_name
         FROM transactions t JOIN accounts a ON a.id=t.account_id WHERE t.bill_id IS NOT NULL ORDER BY t.date,t.id""")
     by_bill: dict[int, list[dict]] = {}
@@ -203,6 +205,28 @@ def bill_rows(db, as_of: date):
             "days_overdue": (as_of - bill["due_date"]).days if bill["due_date"] < as_of and current else 0,
             "paid_cents": sum(p["amount_cents"] for p in history)})
     return result
+
+
+def materialize_fixed_bills(db, as_of: date):
+    """Create one independent payable bill per month, without duplicating existing months."""
+    last_month = add_months(as_of.replace(day=1), 5)
+    horizon = add_months(last_month, 1)
+    origins = all_rows(db, """SELECT * FROM bills WHERE expense_type='fixed'
+        AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
+        AND due_date < %s ORDER BY id FOR UPDATE""", (horizon,))
+    for origin in origins:
+        month_count = (last_month.year - origin["due_date"].year) * 12 + last_month.month - origin["due_date"].month
+        for offset in range(1, month_count + 1):
+            due = add_months(origin["due_date"], offset)
+            month = due.replace(day=1)
+            db.execute("""INSERT INTO bills(account_id,description,category,category_id,subcategory_id,note,
+                amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,
+                recurrence_origin_id,recurrence_month)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s)
+                ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
+                (origin["account_id"], origin["description"], origin["category"], origin["category_id"],
+                 origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
+                 origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], month))
 
 
 @app.get("/health")
@@ -271,6 +295,7 @@ def change_password(value: dict, who=Depends(mutation), db=Depends(db_session)):
 @app.get("/api/state")
 def state(who=Depends(user), db=Depends(db_session)):
     current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    materialize_fixed_bills(db, current)
     accounts = all_rows(db, """SELECT a.*, a.opening_cents + COALESCE(SUM(CASE WHEN t.date>%s THEN 0
         WHEN t.kind='income' THEN t.amount_cents ELSE -t.amount_cents END),0) AS balance_cents
         FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id GROUP BY a.id ORDER BY a.id DESC""", (current,))
@@ -391,16 +416,20 @@ def bill_values(db, value: dict):
         fail(400, "Conta inválida.")
     category_id, subcategory_id, category_name = category_choice(db, value, "expense")
     period = value.get("interestPeriod")
+    expense_type = value.get("expenseType", "eventual")
+    if expense_type not in ("eventual", "fixed"):
+        fail(400, "Tipo de despesa inválido.")
     return (account_id, text(value.get("description"), "Nome da despesa"), category_name,
         category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"),
-        parsed_date(value.get("dueDate")), interest(value.get("interestRateBasisPoints"), period), period)
+        parsed_date(value.get("dueDate")), interest(value.get("interestRateBasisPoints"), period), period, expense_type)
 
 
 @app.post("/api/bills", status_code=201)
 def create_bill(value: dict, who=Depends(mutation), db=Depends(db_session)):
+    fields = bill_values(db, value)
     result = one(db, """INSERT INTO bills(account_id,description,category,category_id,subcategory_id,note,
-        amount_cents,due_date,interest_rate_basis_points,interest_period)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""", bill_values(db, value))
+        amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,recurrence_active)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""", (*fields, fields[-1] == "fixed"))
     return {"id": result["id"]}
 
 
@@ -408,10 +437,35 @@ def create_bill(value: dict, who=Depends(mutation), db=Depends(db_session)):
 def edit_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
     if one(db, "SELECT id FROM transactions WHERE bill_id=%s LIMIT 1", (bill_id,)):
         fail(409, "Uma despesa com pagamentos não pode ser editada.")
+    existing = one(db, "SELECT * FROM bills WHERE id=%s AND archived=FALSE FOR UPDATE", (bill_id,))
+    if not existing:
+        fail(404, "Despesa não encontrada.")
+    fields = bill_values(db, value)
+    if existing["recurrence_origin_id"] and fields[-1] != "fixed":
+        fail(400, "Uma parcela mensal permanece fixa. Exclua esta parcela se não for necessária.")
     if not one(db, """UPDATE bills SET account_id=%s,description=%s,category=%s,category_id=%s,
         subcategory_id=%s,note=%s,amount_cents=%s,due_date=%s,interest_rate_basis_points=%s,
-        interest_period=%s WHERE id=%s RETURNING id""", (*bill_values(db, value), bill_id)):
+        interest_period=%s,expense_type=%s,recurrence_active=%s WHERE id=%s RETURNING id""",
+        (*fields, fields[-1] == "fixed" and existing["recurrence_origin_id"] is None
+         and (existing["expense_type"] != "fixed" or existing["recurrence_active"]), bill_id)):
         fail(404, "Despesa não encontrada.")
+    if existing["recurrence_origin_id"] is None and existing["expense_type"] == "fixed" and fields[-1] == "eventual":
+        db.execute("""UPDATE bills SET archived=TRUE WHERE recurrence_origin_id=%s AND due_date >= %s
+            AND NOT EXISTS (SELECT 1 FROM transactions WHERE bill_id=bills.id)""",
+            (bill_id, today(os.getenv("APP_TIMEZONE", "America/Araguaina"))))
+    elif existing["recurrence_origin_id"] is None and fields[-1] == "fixed":
+        # Existing unpaid months follow changes to the template. Paid months keep their history.
+        children = all_rows(db, """SELECT id,recurrence_month FROM bills WHERE recurrence_origin_id=%s AND archived=FALSE
+            AND recurrence_month >= %s AND NOT EXISTS (SELECT 1 FROM transactions WHERE bill_id=bills.id)""",
+            (bill_id, today(os.getenv("APP_TIMEZONE", "America/Araguaina")).replace(day=1)))
+        for child in children:
+            offset = (child["recurrence_month"].year - fields[7].year) * 12 + child["recurrence_month"].month - fields[7].month
+            if offset < 1:
+                db.execute("UPDATE bills SET archived=TRUE WHERE id=%s", (child["id"],))
+                continue
+            db.execute("""UPDATE bills SET account_id=%s,description=%s,category=%s,category_id=%s,
+                subcategory_id=%s,note=%s,amount_cents=%s,due_date=%s,interest_rate_basis_points=%s,
+                interest_period=%s,archived=FALSE WHERE id=%s""", (*fields[:7], add_months(fields[7], offset), *fields[8:10], child["id"]))
     return {"ok": True}
 
 
@@ -419,8 +473,31 @@ def edit_bill(bill_id: int, value: dict, who=Depends(mutation), db=Depends(db_se
 def delete_bill(bill_id: int, who=Depends(mutation), db=Depends(db_session)):
     if one(db, "SELECT id FROM transactions WHERE bill_id=%s LIMIT 1", (bill_id,)):
         fail(409, "Uma despesa com pagamentos não pode ser excluída.")
-    if not one(db, "DELETE FROM bills WHERE id=%s RETURNING id", (bill_id,)):
+    existing = one(db, "SELECT * FROM bills WHERE id=%s AND archived=FALSE", (bill_id,))
+    if not existing:
         fail(404, "Despesa não encontrada.")
+    if existing["expense_type"] == "fixed":
+        db.execute("UPDATE bills SET archived=TRUE,recurrence_active=FALSE WHERE id=%s", (bill_id,))
+        if existing["recurrence_origin_id"] is None:
+            db.execute("""UPDATE bills SET archived=TRUE WHERE recurrence_origin_id=%s
+                AND NOT EXISTS (SELECT 1 FROM transactions WHERE bill_id=bills.id)""", (bill_id,))
+    else:
+        db.execute("DELETE FROM bills WHERE id=%s", (bill_id,))
+    return {"ok": True}
+
+
+@app.patch("/api/bills/{bill_id}/stop-recurrence")
+def stop_bill_recurrence(bill_id: int, who=Depends(mutation), db=Depends(db_session)):
+    bill = one(db, "SELECT id,expense_type,recurrence_origin_id FROM bills WHERE id=%s AND archived=FALSE", (bill_id,))
+    if not bill:
+        fail(404, "Despesa não encontrada.")
+    if bill["expense_type"] != "fixed":
+        fail(400, "Esta despesa não é fixa.")
+    origin_id = bill["recurrence_origin_id"] or bill_id
+    db.execute("UPDATE bills SET recurrence_active=FALSE WHERE id=%s", (origin_id,))
+    db.execute("""UPDATE bills SET archived=TRUE WHERE recurrence_origin_id=%s AND due_date >= %s
+        AND NOT EXISTS (SELECT 1 FROM transactions WHERE bill_id=bills.id)""",
+        (origin_id, today(os.getenv("APP_TIMEZONE", "America/Araguaina"))))
     return {"ok": True}
 
 
