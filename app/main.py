@@ -231,6 +231,61 @@ def materialize_fixed_bills(db, as_of: date):
                  origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], month))
 
 
+def materialize_fixed_incomes(db, as_of: date):
+    last_month = add_months(as_of.replace(day=1), 5)
+    horizon = add_months(last_month, 1)
+    origins = all_rows(db, """SELECT * FROM planned_incomes WHERE income_type='fixed'
+        AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
+        AND due_date < %s ORDER BY id FOR UPDATE""", (horizon,))
+    for origin in origins:
+        month_count = (last_month.year - origin["due_date"].year) * 12 + last_month.month - origin["due_date"].month
+        for offset in range(1, month_count + 1):
+            due = add_months(origin["due_date"], offset)
+            db.execute("""INSERT INTO planned_incomes(account_id,description,category,category_id,
+                subcategory_id,note,amount_cents,due_date,income_type,recurrence_origin_id,recurrence_month)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s)
+                ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
+                (origin["account_id"], origin["description"], origin["category"], origin["category_id"],
+                 origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
+                 origin["id"], due.replace(day=1)))
+
+
+def income_rows(db, as_of: date):
+    incomes = all_rows(db, """SELECT i.*,origin.recurrence_active AS series_active,
+        c.name AS category_name,s.name AS subcategory_name,a.name AS account_name
+        FROM planned_incomes i JOIN accounts a ON a.id=i.account_id
+        LEFT JOIN planned_incomes origin ON origin.id=COALESCE(i.recurrence_origin_id,i.id)
+        LEFT JOIN categories c ON c.id=i.category_id LEFT JOIN subcategories s ON s.id=i.subcategory_id
+        WHERE i.archived=FALSE ORDER BY i.due_date,i.id""")
+    receipts = all_rows(db, """SELECT t.id,t.planned_income_id,t.account_id,t.amount_cents,t.date,t.note,
+        a.name AS account_name FROM transactions t JOIN accounts a ON a.id=t.account_id
+        WHERE t.planned_income_id IS NOT NULL ORDER BY t.date,t.id""")
+    grouped = {}
+    for receipt in receipts:
+        grouped.setdefault(receipt["planned_income_id"], []).append(receipt)
+    result = []
+    for income in incomes:
+        history = grouped.get(income["id"], [])
+        received = sum(item["amount_cents"] for item in history)
+        remaining = max(0, income["amount_cents"] - received)
+        result.append({**income, "category": income["category_name"] or income["category"],
+            "receipts": history, "received_cents": received, "remaining_cents": remaining,
+            "status": "received" if not remaining else "overdue" if income["due_date"] < as_of else "pending"})
+    return result
+
+
+def monthly_receivables(incomes: list[dict], current: date) -> list[dict]:
+    series = []
+    for offset in range(6):
+        start = add_months(current.replace(day=1), offset)
+        end = add_months(start, 1) - timedelta(days=1)
+        items = [{"id": item["id"], "value_cents": item["remaining_cents"],
+            "carried": item["due_date"] < start} for item in incomes
+            if item["remaining_cents"] and item["due_date"] <= end]
+        series.append({"date": start, "value_cents": sum(item["value_cents"] for item in items), "items": items})
+    return series
+
+
 YIELD_ZONE = ZoneInfo("America/Sao_Paulo")
 
 
@@ -371,6 +426,7 @@ def change_password(value: dict, who=Depends(mutation), db=Depends(db_session)):
 def state(who=Depends(user), db=Depends(db_session)):
     current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
     materialize_fixed_bills(db, current)
+    materialize_fixed_incomes(db, current)
     accrue_passive_yields(db)
     accounts = all_rows(db, """SELECT a.*,r.name AS yield_rate_name,r.annual_basis_points AS yield_annual_basis_points,
         a.opening_cents + COALESCE(SUM(CASE WHEN t.date>%s THEN 0
@@ -390,6 +446,7 @@ def state(who=Depends(user), db=Depends(db_session)):
         investment["current_cents"] = projected_cents(investment["principal_cents"], investment["rate_basis_points"], investment["start_date"], current, investment["period"])
         investment["future_cents"] = projected_cents(investment["principal_cents"], investment["rate_basis_points"], investment["start_date"], add_months(current, 12), investment["period"])
     bills = bill_rows(db, current)
+    incomes = income_rows(db, current)
     categories = all_rows(db, "SELECT id,kind,name FROM categories ORDER BY kind,name")
     yield_rates = all_rows(db, "SELECT id,name,annual_basis_points FROM yield_rates ORDER BY name")
     subcategories = all_rows(db, "SELECT id,category_id,name FROM subcategories ORDER BY name")
@@ -409,9 +466,11 @@ def state(who=Depends(user), db=Depends(db_session)):
     investment_series = [{"date": add_months(current, i), "value_cents": sum(projected_cents(x["principal_cents"], x["rate_basis_points"], x["start_date"], add_months(current, i), x["period"]) or 0 for x in investments)} for i in range(13)]
     debt_series = [{"date": add_months(current, i), "value_cents": sum(debt_cents_at(x, x["payments"], add_months(current, i)) or 0 for x in bills)} for i in range(13)]
     due_series = monthly_payables(bills, current)
+    income_series = monthly_receivables(incomes, current)
     users = all_rows(db, "SELECT id,name,email,role,active FROM users ORDER BY id") if who["role"] == "admin" else []
     return jsonable_encoder({"user": who, "today": current, "accounts": accounts, "transactions": transactions,
-        "investments": investments, "bills": bills, "categories": categories, "subcategories": subcategories,
+        "investments": investments, "bills": bills, "incomes": incomes, "income_series": income_series,
+        "categories": categories, "subcategories": subcategories,
         "yield_rates": yield_rates,
         "monthly_spending": spending, "monthly_totals": month_totals, "investment_series": investment_series,
         "debt_series": debt_series, "due_series": due_series, "users": users})
@@ -441,7 +500,7 @@ def rename_category(category_id: int, value: dict, who=Depends(mutation), db=Dep
 
 @app.delete("/api/categories/{category_id}")
 def delete_category(category_id: int, who=Depends(mutation), db=Depends(db_session)):
-    if one(db, "SELECT id FROM bills WHERE category_id=%s LIMIT 1", (category_id,)) or one(db, "SELECT id FROM transactions WHERE category_id=%s LIMIT 1", (category_id,)) or one(db, "SELECT id FROM subcategories WHERE category_id=%s LIMIT 1", (category_id,)):
+    if one(db, "SELECT id FROM bills WHERE category_id=%s LIMIT 1", (category_id,)) or one(db, "SELECT id FROM planned_incomes WHERE category_id=%s LIMIT 1", (category_id,)) or one(db, "SELECT id FROM transactions WHERE category_id=%s LIMIT 1", (category_id,)) or one(db, "SELECT id FROM subcategories WHERE category_id=%s LIMIT 1", (category_id,)):
         fail(409, "Categoria em uso. Reclassifique os registros e exclua as subcategorias primeiro.")
     if not one(db, "DELETE FROM categories WHERE id=%s RETURNING id", (category_id,)):
         fail(404, "Categoria não encontrada.")
@@ -466,7 +525,7 @@ def rename_subcategory(subcategory_id: int, value: dict, who=Depends(mutation), 
 
 @app.delete("/api/subcategories/{subcategory_id}")
 def delete_subcategory(subcategory_id: int, who=Depends(mutation), db=Depends(db_session)):
-    if one(db, "SELECT id FROM bills WHERE subcategory_id=%s LIMIT 1", (subcategory_id,)) or one(db, "SELECT id FROM transactions WHERE subcategory_id=%s LIMIT 1", (subcategory_id,)):
+    if one(db, "SELECT id FROM bills WHERE subcategory_id=%s LIMIT 1", (subcategory_id,)) or one(db, "SELECT id FROM planned_incomes WHERE subcategory_id=%s LIMIT 1", (subcategory_id,)) or one(db, "SELECT id FROM transactions WHERE subcategory_id=%s LIMIT 1", (subcategory_id,)):
         fail(409, "Subcategoria em uso. Reclassifique os registros primeiro.")
     if not one(db, "DELETE FROM subcategories WHERE id=%s RETURNING id", (subcategory_id,)):
         fail(404, "Subcategoria não encontrada.")
@@ -503,8 +562,8 @@ def edit_account(account_id: int, value: dict, who=Depends(mutation), db=Depends
 
 @app.delete("/api/accounts/{account_id}")
 def delete_account(account_id: int, who=Depends(mutation), db=Depends(db_session)):
-    if one(db, "SELECT id FROM transactions WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM bills WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT 1 FROM passive_yields WHERE account_id=%s LIMIT 1", (account_id,)):
-        fail(409, "Esta conta possui despesas ou lançamentos.")
+    if one(db, "SELECT id FROM transactions WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM bills WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT id FROM planned_incomes WHERE account_id=%s LIMIT 1", (account_id,)) or one(db, "SELECT 1 FROM passive_yields WHERE account_id=%s LIMIT 1", (account_id,)):
+        fail(409, "Esta conta possui despesas, entradas ou lançamentos.")
     if not one(db, "DELETE FROM accounts WHERE id=%s RETURNING id", (account_id,)):
         fail(404, "Conta não encontrada.")
     return {"ok": True}
@@ -557,6 +616,123 @@ def bill_values(db, value: dict):
     return (account_id, text(value.get("description"), "Nome da despesa"), category_name,
         category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"),
         parsed_date(value.get("dueDate")), interest(value.get("interestRateBasisPoints"), period), period, expense_type)
+
+
+def income_values(db, value: dict):
+    account_id = integer(value.get("accountId"), "Conta")
+    if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
+        fail(400, "Conta inválida.")
+    category_id, subcategory_id, category_name = category_choice(db, value, "income")
+    income_type = value.get("incomeType", "eventual")
+    if income_type not in ("eventual", "fixed"):
+        fail(400, "Tipo de entrada inválido.")
+    return (account_id, text(value.get("description"), "Nome da entrada"), category_name,
+        category_id, subcategory_id, note(value.get("note")), integer(value.get("amountCents"), "Valor"),
+        parsed_date(value.get("dueDate")), income_type)
+
+
+@app.post("/api/incomes", status_code=201)
+def create_income(value: dict, who=Depends(mutation), db=Depends(db_session)):
+    fields = income_values(db, value)
+    result = one(db, """INSERT INTO planned_incomes(account_id,description,category,category_id,
+        subcategory_id,note,amount_cents,due_date,income_type,recurrence_active)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""", (*fields, fields[-1] == "fixed"))
+    return {"id": result["id"]}
+
+
+@app.patch("/api/incomes/{income_id}")
+def edit_income(income_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    existing = one(db, "SELECT * FROM planned_incomes WHERE id=%s AND archived=FALSE FOR UPDATE", (income_id,))
+    if not existing:
+        fail(404, "Entrada não encontrada.")
+    if one(db, "SELECT id FROM transactions WHERE planned_income_id=%s LIMIT 1", (income_id,)):
+        fail(409, "Uma entrada com recebimentos não pode ser editada.")
+    fields = income_values(db, value)
+    if existing["recurrence_origin_id"] and fields[-1] != "fixed":
+        fail(400, "Uma parcela mensal permanece fixa.")
+    db.execute("""UPDATE planned_incomes SET account_id=%s,description=%s,category=%s,category_id=%s,
+        subcategory_id=%s,note=%s,amount_cents=%s,due_date=%s,income_type=%s,recurrence_active=%s
+        WHERE id=%s""", (*fields, fields[-1] == "fixed" and existing["recurrence_origin_id"] is None
+        and (existing["income_type"] != "fixed" or existing["recurrence_active"]), income_id))
+    if existing["recurrence_origin_id"] is None and existing["income_type"] == "fixed":
+        if fields[-1] == "eventual":
+            db.execute("""UPDATE planned_incomes SET archived=TRUE WHERE recurrence_origin_id=%s
+                AND NOT EXISTS (SELECT 1 FROM transactions WHERE planned_income_id=planned_incomes.id)""", (income_id,))
+        else:
+            children = all_rows(db, """SELECT id,recurrence_month FROM planned_incomes
+                WHERE recurrence_origin_id=%s AND archived=FALSE
+                AND NOT EXISTS (SELECT 1 FROM transactions WHERE planned_income_id=planned_incomes.id)""", (income_id,))
+            for child in children:
+                offset = (child["recurrence_month"].year - fields[7].year) * 12 + child["recurrence_month"].month - fields[7].month
+                if offset < 1:
+                    db.execute("UPDATE planned_incomes SET archived=TRUE WHERE id=%s", (child["id"],))
+                else:
+                    db.execute("""UPDATE planned_incomes SET account_id=%s,description=%s,category=%s,
+                        category_id=%s,subcategory_id=%s,note=%s,amount_cents=%s,due_date=%s
+                        WHERE id=%s""", (*fields[:7], add_months(fields[7], offset), child["id"]))
+    return {"ok": True}
+
+
+@app.delete("/api/incomes/{income_id}")
+def delete_income(income_id: int, who=Depends(mutation), db=Depends(db_session)):
+    existing = one(db, "SELECT * FROM planned_incomes WHERE id=%s AND archived=FALSE FOR UPDATE", (income_id,))
+    if not existing:
+        fail(404, "Entrada não encontrada.")
+    if one(db, "SELECT id FROM transactions WHERE planned_income_id=%s LIMIT 1", (income_id,)):
+        fail(409, "Uma entrada com recebimentos não pode ser excluída.")
+    if existing["income_type"] == "fixed":
+        db.execute("UPDATE planned_incomes SET archived=TRUE,recurrence_active=FALSE WHERE id=%s", (income_id,))
+        if existing["recurrence_origin_id"] is None:
+            db.execute("""UPDATE planned_incomes SET archived=TRUE WHERE recurrence_origin_id=%s
+                AND NOT EXISTS (SELECT 1 FROM transactions WHERE planned_income_id=planned_incomes.id)""", (income_id,))
+    else:
+        db.execute("DELETE FROM planned_incomes WHERE id=%s", (income_id,))
+    return {"ok": True}
+
+
+@app.patch("/api/incomes/{income_id}/stop-recurrence")
+def stop_income_recurrence(income_id: int, who=Depends(mutation), db=Depends(db_session)):
+    income = one(db, "SELECT * FROM planned_incomes WHERE id=%s AND archived=FALSE", (income_id,))
+    if not income:
+        fail(404, "Entrada não encontrada.")
+    if income["income_type"] != "fixed":
+        fail(400, "Esta entrada não é fixa.")
+    origin_id = income["recurrence_origin_id"] or income_id
+    db.execute("UPDATE planned_incomes SET recurrence_active=FALSE WHERE id=%s", (origin_id,))
+    db.execute("""UPDATE planned_incomes SET archived=TRUE WHERE recurrence_origin_id=%s AND due_date >= %s
+        AND NOT EXISTS (SELECT 1 FROM transactions WHERE planned_income_id=planned_incomes.id)""",
+        (origin_id, today(os.getenv("APP_TIMEZONE", "America/Araguaina"))))
+    return {"ok": True}
+
+
+@app.post("/api/incomes/{income_id}/receipts", status_code=201)
+def receive_income(income_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    when = parsed_date(value.get("date"))
+    if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
+        fail(400, "Registre o recebimento na data em que ele acontecer.")
+    amount = integer(value.get("amountCents"), "Valor recebido")
+    account_id = integer(value.get("accountId"), "Conta")
+    income = one(db, "SELECT * FROM planned_incomes WHERE id=%s AND archived=FALSE FOR UPDATE", (income_id,))
+    if not income:
+        fail(404, "Entrada não encontrada.")
+    if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)):
+        fail(400, "Conta inválida.")
+    received = one(db, "SELECT COALESCE(SUM(amount_cents),0) AS cents FROM transactions WHERE planned_income_id=%s", (income_id,))["cents"]
+    if amount > income["amount_cents"] - received:
+        fail(400, "Recebimento acima do valor restante.")
+    result = one(db, """INSERT INTO transactions(account_id,planned_income_id,kind,description,category,
+        category_id,subcategory_id,note,amount_cents,date)
+        VALUES(%s,%s,'income',%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (account_id, income_id, f"Recebimento: {income['description']}", income["category"],
+         income["category_id"], income["subcategory_id"], note(value.get("note")), amount, when))
+    return {"id": result["id"]}
+
+
+@app.delete("/api/incomes/{income_id}/receipts/{receipt_id}")
+def delete_income_receipt(income_id: int, receipt_id: int, who=Depends(mutation), db=Depends(db_session)):
+    if not one(db, "DELETE FROM transactions WHERE planned_income_id=%s AND id=%s RETURNING id", (income_id, receipt_id)):
+        fail(404, "Recebimento não encontrado.")
+    return {"ok": True}
 
 
 @app.post("/api/bills", status_code=201)
@@ -721,11 +897,13 @@ def create_transaction(value: dict, who=Depends(mutation), db=Depends(db_session
 
 @app.patch("/api/transactions/{transaction_id}")
 def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
-    existing = one(db, "SELECT kind,bill_id FROM transactions WHERE id=%s", (transaction_id,))
+    existing = one(db, "SELECT kind,bill_id,planned_income_id FROM transactions WHERE id=%s", (transaction_id,))
     if not existing:
         fail(404, "Lançamento não encontrado.")
     if existing["bill_id"]:
         fail(409, "Edite o pagamento na despesa correspondente.")
+    if existing["planned_income_id"]:
+        fail(409, "Exclua o recebimento na entrada correspondente.")
     if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
         fail(409, "Rendimentos automáticos não podem ser editados.")
     account_id = integer(value.get("accountId"), "Conta")
@@ -747,6 +925,8 @@ def edit_transaction(transaction_id: int, value: dict, who=Depends(mutation), db
 def delete_transaction(transaction_id: int, who=Depends(mutation), db=Depends(db_session)):
     if one(db, "SELECT id FROM transactions WHERE id=%s AND bill_id IS NOT NULL", (transaction_id,)):
         fail(409, "Exclua o pagamento na despesa correspondente.")
+    if one(db, "SELECT id FROM transactions WHERE id=%s AND planned_income_id IS NOT NULL", (transaction_id,)):
+        fail(409, "Exclua o recebimento na entrada correspondente.")
     if one(db, "SELECT 1 FROM passive_yields WHERE transaction_id=%s", (transaction_id,)):
         fail(409, "Rendimentos automáticos não podem ser excluídos.")
     if not one(db, "DELETE FROM transactions WHERE id=%s RETURNING id", (transaction_id,)):

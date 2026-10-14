@@ -66,6 +66,24 @@ ALTER TABLE bills ADD COLUMN IF NOT EXISTS recurrence_month DATE;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS recurrence_active BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE bills ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE UNIQUE INDEX IF NOT EXISTS bills_recurrence_month_idx ON bills(recurrence_origin_id, recurrence_month);
+CREATE TABLE IF NOT EXISTS planned_incomes (
+  id BIGSERIAL PRIMARY KEY,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  description TEXT NOT NULL,
+  category TEXT NOT NULL,
+  category_id BIGINT REFERENCES categories(id) ON DELETE RESTRICT,
+  subcategory_id BIGINT REFERENCES subcategories(id) ON DELETE RESTRICT,
+  note TEXT NOT NULL DEFAULT '',
+  amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+  due_date DATE NOT NULL,
+  income_type TEXT NOT NULL CHECK (income_type IN ('eventual', 'fixed')),
+  recurrence_origin_id BIGINT REFERENCES planned_incomes(id) ON DELETE RESTRICT,
+  recurrence_month DATE,
+  recurrence_active BOOLEAN NOT NULL DEFAULT FALSE,
+  archived BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS planned_incomes_recurrence_month_idx ON planned_incomes(recurrence_origin_id, recurrence_month);
 CREATE TABLE IF NOT EXISTS transactions (
   id BIGSERIAL PRIMARY KEY,
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
@@ -77,6 +95,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bill_id BIGINT REFERENCES bills(id) ON DELETE RESTRICT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS planned_income_id BIGINT REFERENCES planned_incomes(id) ON DELETE RESTRICT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES categories(id) ON DELETE RESTRICT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS subcategory_id BIGINT REFERENCES subcategories(id) ON DELETE RESTRICT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';

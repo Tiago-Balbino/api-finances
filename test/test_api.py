@@ -5,7 +5,8 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 
 from app.main import (app, category_choice, daily_yield_cents, materialize_fixed_bills,
-                      monthly_payables, verify_password, yield_start)
+                      materialize_fixed_incomes, monthly_payables, monthly_receivables,
+                      verify_password, yield_start)
 
 
 class FakeResult:
@@ -43,6 +44,23 @@ class FakeRecurringBills:
         raise AssertionError(query)
 
 
+class FakeRecurringIncomes:
+    def __init__(self):
+        self.due_dates = []
+
+    def execute(self, query, params):
+        if "SELECT * FROM planned_incomes WHERE income_type='fixed'" in query:
+            return type("Rows", (), {"fetchall": lambda _: [{
+                "id": 8, "account_id": 1, "description": "Salário", "category": "Salário",
+                "category_id": 1, "subcategory_id": None, "note": "", "amount_cents": 500000,
+                "due_date": date(2026, 1, 31),
+            }]})()
+        if "INSERT INTO planned_incomes" in query:
+            self.due_dates.append(params[7])
+            return FakeResult(None)
+        raise AssertionError(query)
+
+
 class ApiTests(unittest.TestCase):
     def test_legacy_node_password_hash_still_works(self):
         old_hash = "0123456789abcdef:62c5c6e51a9f43acf395e9620da3d8d6ab338be6dd7a8421564cc00e1d58c60e2097f8d1834005a29e4d433576ce0d20a8406424750df531d5a0bc4d29759a84"
@@ -72,6 +90,16 @@ class ApiTests(unittest.TestCase):
                 "status": "overdue", "payments": []}
         series = monthly_payables([bill], date(2026, 10, 14))
         self.assertEqual([point["value_cents"] for point in series], [10000] * 6)
+        self.assertTrue(all(point["items"][0]["carried"] for point in series))
+
+    def test_fixed_salary_repeats_from_original_day_and_unreceived_amount_carries(self):
+        db = FakeRecurringIncomes()
+        materialize_fixed_incomes(db, date(2026, 2, 15))
+        self.assertEqual(db.due_dates, [date(2026, 2, 28), date(2026, 3, 31),
+            date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31)])
+        income = {"id": 1, "due_date": date(2026, 9, 10), "remaining_cents": 300000}
+        series = monthly_receivables([income], date(2026, 10, 14))
+        self.assertEqual([point["value_cents"] for point in series], [300000] * 6)
         self.assertTrue(all(point["items"][0]["carried"] for point in series))
 
     def test_passive_yield_uses_effective_annual_rate_and_starts_at_eight(self):
