@@ -96,3 +96,13 @@ CREATE INDEX IF NOT EXISTS transactions_bill_idx ON transactions(bill_id);
 CREATE INDEX IF NOT EXISTS bills_due_idx ON bills(due_date);
 CREATE INDEX IF NOT EXISTS transactions_category_date_idx ON transactions(category_id,date DESC);
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
+-- Bloqueia acesso pela API REST do Supabase (anon/authenticated). A aplicação conecta como dona das tabelas e não é afetada.
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE subcategories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bills ENABLE ROW LEVEL SECURITY;
+ALTER TABLE investments ENABLE ROW LEVEL SECURITY;

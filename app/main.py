@@ -21,7 +21,7 @@ from .finance import add_months, bill_status, debt_cents_at, projected_cents, to
 
 
 def connect():
-    return psycopg.connect(os.getenv("DATABASE_URL", "dbname=" + os.getenv("PGDATABASE", "finances")), row_factory=dict_row)
+    return psycopg.connect(os.getenv("DATABASE_URL", "dbname=" + os.getenv("PGDATABASE", "finances")), row_factory=dict_row, prepare_threshold=None)
 
 
 @asynccontextmanager

@@ -1,0 +1,12 @@
+server.js
+finance.js
+package.json
+node_modules
+test
+spec
+scripts
+Dockerfile
+compose.yaml
+.pgdata
+.pgsocket
+.venv
