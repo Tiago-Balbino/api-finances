@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS investments (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE investments ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS investment_movements (
+  id BIGSERIAL PRIMARY KEY,
+  investment_id BIGINT NOT NULL REFERENCES investments(id) ON DELETE CASCADE,
+  direction TEXT NOT NULL CHECK (direction IN ('deposit', 'withdraw')),
+  amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+  date DATE NOT NULL,
+  account_id BIGINT REFERENCES accounts(id) ON DELETE RESTRICT,
+  transaction_id BIGINT UNIQUE REFERENCES transactions(id) ON DELETE RESTRICT,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS investment_movements_investment_idx ON investment_movements(investment_id);
+-- Older boxes only had an initial amount; it becomes their first deposit.
+ALTER TABLE investments ADD COLUMN IF NOT EXISTS movements_seeded BOOLEAN NOT NULL DEFAULT FALSE;
+INSERT INTO investment_movements(investment_id,direction,amount_cents,date)
+SELECT id,'deposit',principal_cents,start_date FROM investments WHERE movements_seeded=FALSE;
+UPDATE investments SET movements_seeded=TRUE WHERE movements_seeded=FALSE;
 CREATE TABLE IF NOT EXISTS credit_cards (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL CHECK (length(trim(name)) > 0),
@@ -190,6 +207,10 @@ CREATE INDEX IF NOT EXISTS transactions_category_date_idx ON transactions(catego
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS transactions_invoice_bill_idx ON transactions(invoice_bill_id);
 CREATE INDEX IF NOT EXISTS transactions_card_purchase_idx ON transactions(card_purchase_id);
+CREATE INDEX IF NOT EXISTS transactions_planned_income_idx ON transactions(planned_income_id);
+CREATE INDEX IF NOT EXISTS transactions_credit_card_idx ON transactions(credit_card_id);
+CREATE INDEX IF NOT EXISTS transactions_account_date_idx ON transactions(account_id,date);
+CREATE INDEX IF NOT EXISTS bills_credit_card_idx ON bills(credit_card_id) WHERE credit_card_id IS NOT NULL;
 
 -- Bloqueia acesso pela API REST do Supabase (anon/authenticated). A aplicação conecta como dona das tabelas e não é afetada.
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -206,3 +227,4 @@ ALTER TABLE yield_rate_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE passive_yields ENABLE ROW LEVEL SECURITY;
 ALTER TABLE credit_cards ENABLE ROW LEVEL SECURITY;
 ALTER TABLE card_purchases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE investment_movements ENABLE ROW LEVEL SECURITY;

@@ -6,9 +6,9 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from app.main import (app, bcb_observations, category_choice, daily_yield_cents, fixed_rate_projection, forecast_series,
-                      materialize_fixed_bills,
-                      materialize_fixed_incomes, monthly_payables, monthly_receivables,
+from app.main import (app, bcb_observations, bill_month_summary, income_month_summary, investment_value, category_choice, daily_yield_cents, fixed_rate_projection, forecast_series,
+                      missing_recurrences,
+                      monthly_payables, monthly_receivables,
                       verify_password, yield_start)
 
 
@@ -26,41 +26,6 @@ class FakeCategories:
             return FakeResult({"id": 1, "name": "Moradia"} if params == (1, "expense") else None)
         if "FROM subcategories" in query:
             return FakeResult({"id": 2} if params == (2, 1) else None)
-        raise AssertionError(query)
-
-
-class FakeRecurringBills:
-    def __init__(self):
-        self.due_dates = []
-
-    def execute(self, query, params):
-        if "SELECT * FROM bills WHERE expense_type='fixed'" in query:
-            return type("Rows", (), {"fetchall": lambda _: [{
-                "id": 7, "account_id": 1, "description": "Aluguel", "category": "Moradia",
-                "category_id": 1, "subcategory_id": None, "note": "", "amount_cents": 10000,
-                "due_date": date(2026, 1, 31), "interest_rate_basis_points": 0,
-                "interest_period": "monthly",
-            }]})()
-        if "INSERT INTO bills" in query:
-            self.due_dates.append(params[7])
-            return FakeResult(None)
-        raise AssertionError(query)
-
-
-class FakeRecurringIncomes:
-    def __init__(self):
-        self.due_dates = []
-
-    def execute(self, query, params):
-        if "SELECT * FROM planned_incomes WHERE income_type='fixed'" in query:
-            return type("Rows", (), {"fetchall": lambda _: [{
-                "id": 8, "account_id": 1, "description": "Salário", "category": "Salário",
-                "category_id": 1, "subcategory_id": None, "note": "", "amount_cents": 500000,
-                "due_date": date(2026, 1, 31),
-            }]})()
-        if "INSERT INTO planned_incomes" in query:
-            self.due_dates.append(params[7])
-            return FakeResult(None)
         raise AssertionError(query)
 
 
@@ -84,11 +49,17 @@ class ApiTests(unittest.TestCase):
             "/api/cards", "/api/cards/{card_id}/collateral", "/api/card-purchases/{purchase_id}"} <= paths)
 
     def test_fixed_expense_repeats_monthly_from_original_day(self):
-        db = FakeRecurringBills()
-        materialize_fixed_bills(db, date(2026, 2, 15))
-        self.assertEqual(db.due_dates, [date(2026, 2, 28), date(2026, 3, 31),
+        origin = {"id": 7, "due_date": date(2026, 1, 31)}
+        missing = missing_recurrences([origin], set(), date(2026, 2, 15))
+        self.assertEqual([due for _, due in missing], [date(2026, 2, 28), date(2026, 3, 31),
             date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31), date(2026, 8, 31),
             date(2026, 9, 30), date(2026, 10, 31), date(2026, 11, 30), date(2026, 12, 31), date(2027, 1, 31)])
+
+    def test_existing_or_archived_months_are_not_recreated(self):
+        origin = {"id": 7, "due_date": date(2026, 1, 31)}
+        existing = {(7, date(2026, month, 1)) for month in range(2, 13)}
+        self.assertEqual([due for _, due in missing_recurrences([origin], existing, date(2026, 2, 15))],
+            [date(2027, 1, 31)])
 
     def test_unpaid_expense_carries_into_each_next_month(self):
         bill = {"id": 1, "amount_cents": 10000, "due_date": date(2026, 9, 10),
@@ -98,12 +69,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([point["value_cents"] for point in series], [10000] * 6)
         self.assertTrue(all(point["items"][0]["carried"] for point in series))
 
-    def test_fixed_salary_repeats_from_original_day_and_unreceived_amount_carries(self):
-        db = FakeRecurringIncomes()
-        materialize_fixed_incomes(db, date(2026, 2, 15))
-        self.assertEqual(db.due_dates, [date(2026, 2, 28), date(2026, 3, 31),
-            date(2026, 4, 30), date(2026, 5, 31), date(2026, 6, 30), date(2026, 7, 31), date(2026, 8, 31),
-            date(2026, 9, 30), date(2026, 10, 31), date(2026, 11, 30), date(2026, 12, 31), date(2027, 1, 31)])
+    def test_unreceived_amount_carries(self):
         income = {"id": 1, "due_date": date(2026, 9, 10), "remaining_cents": 300000}
         series = monthly_receivables([income], date(2026, 10, 14))
         self.assertEqual([point["value_cents"] for point in series], [300000] * 6)
@@ -148,6 +114,65 @@ class ApiTests(unittest.TestCase):
         self.assertGreater(december["payable_carried_cents"], november["payable_carried_cents"] - 5000)
         self.assertEqual(december["balance_cents"], 320000)
         self.assertEqual(december["gap_cents"], december["balance_cents"] - december["payable_cents"])
+
+    def bill(self, id, due, amount=10000, kind="eventual", payments=(), card=None, rate=0):
+        return {"id": id, "due_date": due, "amount_cents": amount, "expense_type": kind, "credit_card_id": card,
+                "interest_rate_basis_points": rate, "interest_period": "monthly", "payments": list(payments)}
+
+    def test_bill_month_splits_overdue_upcoming_paid_and_living_cost(self):
+        today = date(2026, 10, 14)
+        bills = [
+            self.bill(1, date(2026, 9, 10)),                                  # atrasada de setembro
+            self.bill(2, date(2026, 10, 5), 20000, "fixed",                   # fixa vencida e parcialmente paga
+                      [{"id": 9, "date": date(2026, 10, 6), "amount_cents": 5000}]),
+            self.bill(3, date(2026, 10, 20), 30000, "fixed"),                  # fixa a vencer
+            self.bill(4, date(2026, 10, 25), 7000),                            # eventual a vencer
+            self.bill(5, date(2026, 10, 12), 40000, card=1),                   # fatura
+            self.bill(6, date(2026, 11, 5), 99999, "fixed"),                   # mês seguinte
+        ]
+        incomes = [{"id": 1, "income_type": "fixed", "due_date": date(2026, 10, 5), "amount_cents": 500000}]
+        result = bill_month_summary(bills, incomes, date(2026, 10, 1), today)
+        self.assertEqual(result["overdue_cents"], 10000 + 15000 + 40000)
+        self.assertEqual(result["upcoming_cents"], 30000 + 7000)
+        self.assertEqual(result["remaining_cents"], result["overdue_cents"] + result["upcoming_cents"])
+        self.assertEqual(result["paid_cents"], 5000)
+        self.assertEqual(result["fixed"], {"total_cents": 50000, "paid_cents": 5000, "remaining_cents": 45000, "count": 2})
+        self.assertEqual(result["eventual"]["total_cents"], 7000)
+        self.assertEqual(result["invoice"]["total_cents"], 40000)
+        self.assertEqual(result["living_cost_share_bp"], 1000)
+        self.assertEqual({item["id"] for item in result["items"]}, {1, 2, 3, 4, 5})
+
+    def test_future_month_only_counts_earlier_debts_as_overdue(self):
+        bills = [self.bill(1, date(2026, 9, 10), rate=100), self.bill(2, date(2026, 11, 20))]
+        result = bill_month_summary(bills, [], date(2026, 11, 1), date(2026, 10, 14))
+        self.assertGreater(result["overdue_cents"], 10000)   # juros acumulados até o fim de novembro
+        self.assertEqual(result["upcoming_cents"], 10000)
+        self.assertEqual(result["paid_cents"], 0)
+
+    def test_past_month_shows_payments_made_in_that_month(self):
+        bills = [self.bill(1, date(2026, 8, 10), payments=[{"id": 1, "date": date(2026, 8, 9), "amount_cents": 10000}])]
+        result = bill_month_summary(bills, [], date(2026, 8, 1), date(2026, 10, 14))
+        self.assertEqual((result["paid_cents"], result["remaining_cents"]), (10000, 0))
+
+    def test_income_month_separates_yield_and_what_is_still_coming(self):
+        incomes = [{"id": 1, "income_type": "fixed", "due_date": date(2026, 10, 5), "amount_cents": 500000,
+                    "receipts": [{"date": date(2026, 10, 5), "amount_cents": 300000}]},
+                   {"id": 2, "income_type": "eventual", "due_date": date(2026, 10, 30), "amount_cents": 80000, "receipts": []}]
+        received = [{"amount_cents": 300000, "category": "Salário", "automatic_yield": False},
+                    {"amount_cents": 1200, "category": "Investimentos", "automatic_yield": True}]
+        result = income_month_summary(incomes, received, date(2026, 10, 1), date(2026, 10, 14))
+        self.assertEqual((result["received_cents"], result["yield_cents"]), (301200, 1200))
+        self.assertEqual((result["overdue_cents"], result["upcoming_cents"]), (200000, 80000))
+        self.assertEqual(result["fixed_expected_cents"], 500000)
+        self.assertEqual(result["categories"][0]["category"], "Salário")
+
+    def test_investment_value_compounds_each_movement_from_its_date(self):
+        box = {"rate_basis_points": 100, "period": "monthly"}
+        movements = [{"direction": "deposit", "amount_cents": 10000, "date": date(2026, 1, 10)},
+                     {"direction": "deposit", "amount_cents": 10000, "date": date(2026, 2, 10)},
+                     {"direction": "withdraw", "amount_cents": 5000, "date": date(2026, 3, 10)}]
+        self.assertEqual(investment_value(box, movements, date(2026, 2, 10)), 10100 + 10000)
+        self.assertEqual(investment_value(box, movements, date(2026, 3, 10)), 10201 + 10100 - 5000)
 
 
 if __name__ == "__main__":

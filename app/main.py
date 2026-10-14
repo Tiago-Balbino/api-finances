@@ -17,27 +17,56 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from .finance import (add_months, bill_status, debt_cents_at, invoice_dates, is_business_day, projected_cents,
                       split_installments, today)
 
 
+def database_url() -> str:
+    return os.getenv("DATABASE_URL", "dbname=" + os.getenv("PGDATABASE", "finances"))
+
+
 def connect():
-    return psycopg.connect(os.getenv("DATABASE_URL", "dbname=" + os.getenv("PGDATABASE", "finances")), row_factory=dict_row, prepare_threshold=None)
+    return psycopg.connect(database_url(), row_factory=dict_row, prepare_threshold=None)
+
+
+# Reusing connections avoids a new TLS handshake with the database on every request.
+# Warm serverless instances keep the pool between invocations.
+pool = ConnectionPool(database_url(), kwargs={"row_factory": dict_row, "prepare_threshold": None},
+    min_size=1, max_size=int(os.getenv("DB_POOL_SIZE", "4")), max_idle=120,
+    check=ConnectionPool.check_connection, open=False)
+
+
+def apply_schema(db):
+    schema = Path(__file__).resolve().parents[1].joinpath("schema.sql").read_text()
+    digest = hashlib.sha256(schema.encode()).hexdigest()
+    db.execute("CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY, digest TEXT NOT NULL)")
+    db.execute("ALTER TABLE schema_meta ENABLE ROW LEVEL SECURITY")
+    current = db.execute("SELECT digest FROM schema_meta WHERE id=1").fetchone()
+    if current and current["digest"] == digest:
+        return False
+    db.execute(schema)
+    db.execute("""INSERT INTO schema_meta(id,digest) VALUES(1,%s)
+        ON CONFLICT (id) DO UPDATE SET digest=EXCLUDED.digest""", (digest,))
+    return True
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    with connect() as db:
-        db.execute(Path(__file__).resolve().parents[1].joinpath("schema.sql").read_text())
+    pool.open()
+    with pool.connection() as db:
+        apply_schema(db)
     yield
+    pool.close()
 
 
 app = FastAPI(title="Finances API", version="3.0", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 login_attempts: dict[str, tuple[int, float]] = {}
 
 
@@ -56,12 +85,26 @@ async def http_error_handler(_: Request, error: HTTPException):
     return JSONResponse(status_code=error.status_code, content={"error": error.detail})
 
 
+def json_default(value: Any):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    raise TypeError(f"Tipo não serializável: {type(value).__name__}")
+
+
+def json_response(payload: Any) -> Response:
+    # json.dumps runs in C; jsonable_encoder walks every value in Python and dominated large responses.
+    return Response(json.dumps(payload, default=json_default, separators=(",", ":"), ensure_ascii=False),
+        media_type="application/json")
+
+
 def fail(status: int, message: str):
     raise HTTPException(status_code=status, detail=message)
 
 
 def db_session():
-    with connect() as db:
+    with pool.connection() as db:
         yield db
 
 
@@ -209,6 +252,7 @@ def admin(result):
 
 
 FORECAST_MONTHS = 12
+PERIOD_LABELS = {"daily": "ao dia", "monthly": "ao mês", "yearly": "ao ano"}
 PAYMENT_METHODS = ("pix", "debit", "credit")
 
 
@@ -251,47 +295,59 @@ def bill_rows(db, as_of: date):
     return result
 
 
-def materialize_fixed_bills(db, as_of: date):
-    """Create one independent payable bill per month, without duplicating existing months."""
+def missing_recurrences(origins: list[dict], existing: set[tuple[int, date]], as_of: date) -> list[tuple[dict, date]]:
+    """Monthly occurrences (origin, due date) still to be created up to the forecast horizon."""
     last_month = add_months(as_of.replace(day=1), FORECAST_MONTHS - 1)
-    horizon = add_months(last_month, 1)
-    origins = all_rows(db, """SELECT * FROM bills WHERE expense_type='fixed'
-        AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
-        AND due_date < %s ORDER BY id FOR UPDATE""", (horizon,))
+    result = []
     for origin in origins:
         month_count = (last_month.year - origin["due_date"].year) * 12 + last_month.month - origin["due_date"].month
         for offset in range(1, month_count + 1):
             due = add_months(origin["due_date"], offset)
-            month = due.replace(day=1)
-            db.execute("""INSERT INTO bills(account_id,description,category,category_id,subcategory_id,note,
-                amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,
-                recurrence_origin_id,recurrence_month,payment_method,interest_rate_period,fine_basis_points,fine_after)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
-                (origin["account_id"], origin["description"], origin["category"], origin["category_id"],
-                 origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
-                 origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], month,
-                 origin.get("payment_method", "pix"), origin.get("interest_rate_period"),
-                 origin.get("fine_basis_points", 0), origin.get("fine_after", "day")))
+            if (origin["id"], due.replace(day=1)) not in existing:
+                result.append((origin, due))
+    return result
+
+
+def recurrence_state(db, table: str, type_column: str, as_of: date):
+    horizon = add_months(as_of.replace(day=1), FORECAST_MONTHS)
+    origins = all_rows(db, f"""SELECT * FROM {table} WHERE {type_column}='fixed'
+        AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
+        AND due_date < %s ORDER BY id""", (horizon,))
+    if not origins:
+        return []
+    # Archived months stay in the table, so a deleted month is never recreated.
+    existing = {(row["recurrence_origin_id"], row["recurrence_month"]) for row in all_rows(db,
+        f"SELECT recurrence_origin_id,recurrence_month FROM {table} WHERE recurrence_origin_id = ANY(%s)",
+        ([origin["id"] for origin in origins],))}
+    return missing_recurrences(origins, existing, as_of)
+
+
+def materialize_fixed_bills(db, as_of: date):
+    """Create one independent payable bill per month, without duplicating existing months."""
+    missing = recurrence_state(db, "bills", "expense_type", as_of)
+    if missing:
+        db.cursor().executemany("""INSERT INTO bills(account_id,description,category,category_id,subcategory_id,note,
+            amount_cents,due_date,interest_rate_basis_points,interest_period,expense_type,
+            recurrence_origin_id,recurrence_month,payment_method,interest_rate_period,fine_basis_points,fine_after)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
+            [(origin["account_id"], origin["description"], origin["category"], origin["category_id"],
+              origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
+              origin["interest_rate_basis_points"], origin["interest_period"], origin["id"], due.replace(day=1),
+              origin["payment_method"], origin["interest_rate_period"], origin["fine_basis_points"],
+              origin["fine_after"]) for origin, due in missing])
 
 
 def materialize_fixed_incomes(db, as_of: date):
-    last_month = add_months(as_of.replace(day=1), FORECAST_MONTHS - 1)
-    horizon = add_months(last_month, 1)
-    origins = all_rows(db, """SELECT * FROM planned_incomes WHERE income_type='fixed'
-        AND recurrence_origin_id IS NULL AND recurrence_active=TRUE AND archived=FALSE
-        AND due_date < %s ORDER BY id FOR UPDATE""", (horizon,))
-    for origin in origins:
-        month_count = (last_month.year - origin["due_date"].year) * 12 + last_month.month - origin["due_date"].month
-        for offset in range(1, month_count + 1):
-            due = add_months(origin["due_date"], offset)
-            db.execute("""INSERT INTO planned_incomes(account_id,description,category,category_id,
-                subcategory_id,note,amount_cents,due_date,income_type,recurrence_origin_id,recurrence_month)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s)
-                ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
-                (origin["account_id"], origin["description"], origin["category"], origin["category_id"],
-                 origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
-                 origin["id"], due.replace(day=1)))
+    missing = recurrence_state(db, "planned_incomes", "income_type", as_of)
+    if missing:
+        db.cursor().executemany("""INSERT INTO planned_incomes(account_id,description,category,category_id,
+            subcategory_id,note,amount_cents,due_date,income_type,recurrence_origin_id,recurrence_month)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'fixed',%s,%s)
+            ON CONFLICT (recurrence_origin_id,recurrence_month) DO NOTHING""",
+            [(origin["account_id"], origin["description"], origin["category"], origin["category_id"],
+              origin["subcategory_id"], origin["note"], origin["amount_cents"], due,
+              origin["id"], due.replace(day=1)) for origin, due in missing])
 
 
 def income_rows(db, as_of: date):
@@ -434,41 +490,64 @@ def daily_yield_cents(balance_cents: int, annual_basis_points: int, multiplier_b
 def accrue_passive_yields(db, now: datetime | None = None) -> int:
     now = now or yield_clock()
     cutoff = now.date() if now.time() >= clock_time(8) else now.date() - timedelta(days=1)
-    accounts = all_rows(db, """SELECT a.*,r.name AS rate_name,r.annual_basis_points,r.source_code
+    accounts = all_rows(db, """SELECT a.*,r.name AS rate_name,r.annual_basis_points,r.source_code,
+        (SELECT max(p.date) FROM passive_yields p WHERE p.account_id=a.id) AS last_accrued
         FROM accounts a JOIN yield_rates r ON r.id=a.yield_rate_id
         WHERE a.yield_start_date IS NOT NULL AND a.yield_start_date <= %s
         ORDER BY a.id FOR UPDATE OF a""", (cutoff,))
+    pending = [account for account in accounts if (max(account["yield_start_date"], account["last_accrued"]
+        + timedelta(days=1)) if account["last_accrued"] else account["yield_start_date"]) <= cutoff]
+    if not pending:
+        return 0
     category = one(db, "SELECT id FROM categories WHERE kind='income' AND name='Investimentos'")
     created = 0
-    for account in accounts:
-        last = one(db, "SELECT max(date) AS last FROM passive_yields WHERE account_id=%s", (account["id"],))["last"]
+    for account in pending:
+        last = account["last_accrued"]
         current = max(account["yield_start_date"], last + timedelta(days=1)) if last else account["yield_start_date"]
+        # Load the account history once and rebuild the 8 a.m. balance of each day in memory.
+        running = one(db, """SELECT a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income'
+            THEN t.amount_cents ELSE -t.amount_cents END),0) AS cents
+            FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id AND t.movement_type<>'card_purchase'
+            AND t.date < %s WHERE a.id=%s GROUP BY a.id""", (current, account["id"]))["cents"]
+        movements = all_rows(db, """SELECT date,created_at,CASE WHEN kind='income' THEN amount_cents
+            ELSE -amount_cents END AS cents FROM transactions WHERE account_id=%s
+            AND movement_type<>'card_purchase' AND date BETWEEN %s AND %s ORDER BY date,created_at""",
+            (account["id"], current, cutoff))
+        observations = all_rows(db, """SELECT date,annual_basis_points FROM yield_rate_observations
+            WHERE source_code=%s AND date<=%s ORDER BY date""", (account["source_code"], cutoff)) \
+            if account["source_code"] else []
+        index = next_observation = 0
+        observed = None
+        zero_days = []
         while current <= cutoff:
+            while index < len(movements) and movements[index]["date"] < current:
+                running += movements[index]["cents"]
+                index += 1
+            while next_observation < len(observations) and observations[next_observation]["date"] <= current:
+                observed = observations[next_observation]["annual_basis_points"]
+                next_observation += 1
             if is_business_day(current):
                 at_eight = datetime.combine(current, clock_time(8), tzinfo=YIELD_ZONE)
-                balance = one(db, """SELECT a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income'
-                    THEN t.amount_cents ELSE -t.amount_cents END),0) AS cents
-                    FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id AND t.movement_type<>'card_purchase'
-                    AND (t.date < %s OR (t.date = %s AND t.created_at <= %s))
-                    WHERE a.id=%s GROUP BY a.id""", (current, current, at_eight, account["id"]))["cents"]
-                observation = one(db, """SELECT annual_basis_points FROM yield_rate_observations
-                    WHERE source_code=%s AND date<=%s ORDER BY date DESC LIMIT 1""",
-                    (account["source_code"], current)) if account["source_code"] else None
-                annual_points = observation["annual_basis_points"] if observation else account["annual_basis_points"]
-                amount = daily_yield_cents(balance, annual_points,
-                    account["yield_multiplier_basis_points"])
-                transaction_id = None
+                balance = running + sum(item["cents"] for item in movements[index:]
+                    if item["date"] == current and item["created_at"] <= at_eight)
+                annual_points = observed if observed is not None else account["annual_basis_points"]
+                amount = daily_yield_cents(balance, annual_points, account["yield_multiplier_basis_points"])
                 if amount:
-                    result = one(db, """INSERT INTO transactions(account_id,kind,description,category,category_id,
-                        note,amount_cents,date) VALUES(%s,'income',%s,'Investimentos',%s,%s,%s,%s) RETURNING id""",
+                    db.execute("""WITH created AS (INSERT INTO transactions(account_id,kind,description,category,
+                        category_id,note,amount_cents,date) VALUES(%s,'income',%s,'Investimentos',%s,%s,%s,%s) RETURNING id)
+                        INSERT INTO passive_yields(account_id,date,amount_cents,transaction_id)
+                        SELECT %s,%s,%s,id FROM created""",
                         (account["id"], f"Rendimento: {account['name']}", category["id"] if category else None,
                          f"{account['yield_multiplier_basis_points'] / 100:g}% de {account['rate_name']}"
-                         f" ({annual_points / 100:g}% a.a.)", amount, current))
-                    transaction_id = result["id"]
+                         f" ({annual_points / 100:g}% a.a.)", amount, current, account["id"], current, amount))
+                    # The credit is dated today and recorded after 8 a.m., so it counts from the next day on.
+                    running += amount
                     created += 1
-                db.execute("INSERT INTO passive_yields(account_id,date,amount_cents,transaction_id) VALUES(%s,%s,%s,%s)",
-                    (account["id"], current, amount, transaction_id))
+                else:
+                    zero_days.append((account["id"], current))
             current += timedelta(days=1)
+        if zero_days:
+            db.cursor().executemany("INSERT INTO passive_yields(account_id,date,amount_cents) VALUES(%s,%s,0)", zero_days)
     return created
 
 
@@ -484,6 +563,138 @@ def monthly_payables(bills: list[dict], current: date, months: int = 6) -> list[
         series.append({"date": month_start, "value_cents": sum(item["value_cents"] or 0 for item in items),
             "items": items})
     return series
+
+
+def investment_value(investment: dict, movements: list[dict], as_of: date) -> int:
+    """Each deposit (or withdrawal, negative) compounds from its own date at the box rate."""
+    return sum(projected_cents(item["amount_cents"] * (1 if item["direction"] == "deposit" else -1),
+        investment["rate_basis_points"], item["date"], as_of, investment["period"]) or 0
+        for item in movements if item["date"] <= as_of)
+
+
+def investment_net(movements: list[dict], as_of: date) -> int:
+    return sum(item["amount_cents"] * (1 if item["direction"] == "deposit" else -1)
+        for item in movements if item["date"] <= as_of)
+
+
+def investment_rows(db, current: date) -> list[dict]:
+    investments = all_rows(db, "SELECT * FROM investments ORDER BY id DESC")
+    movements = all_rows(db, """SELECT m.*,a.name AS account_name FROM investment_movements m
+        LEFT JOIN accounts a ON a.id=m.account_id ORDER BY m.date,m.id""")
+    for investment in investments:
+        history = [item for item in movements if item["investment_id"] == investment["id"]]
+        month_start = current.replace(day=1) - timedelta(days=1)
+        investment["movements"] = history
+        investment["invested_cents"] = investment_net(history, current)
+        investment["current_cents"] = investment_value(investment, history, current)
+        investment["yield_cents"] = investment["current_cents"] - investment["invested_cents"]
+        investment["month_yield_cents"] = investment["yield_cents"] - (investment_value(investment, history, month_start)
+            - investment_net(history, month_start))
+        investment["future_cents"] = investment_value(investment, history, add_months(current, 12))
+        investment["next_month_yield_cents"] = investment_value(investment, history, add_months(current, 1)) \
+            - investment["current_cents"]
+    return investments
+
+
+def month_reference(start: date, current: date) -> tuple[date, date, date]:
+    """End of month, reference date for balances and the cut for what counts as overdue.
+
+    Current month: today. Past months: month end. Future months: nothing is assumed paid,
+    so balances are taken at month end and only debts from earlier months count as overdue."""
+    end = add_months(start, 1) - timedelta(days=1)
+    if start <= current <= end:
+        return end, current, current
+    if end < current:
+        return end, end, end + timedelta(days=1)
+    return end, end, start
+
+
+def bill_month_summary(bills: list[dict], incomes: list[dict], start: date, current: date) -> dict:
+    end, reference, overdue_cut = month_reference(start, current)
+    groups = {key: {"total_cents": 0, "paid_cents": 0, "remaining_cents": 0, "count": 0}
+        for key in ("fixed", "eventual", "invoice")}
+    items, upcoming, overdue, overdue_count = [], 0, 0, 0
+    paid, paid_month_bills, payments_count = 0, 0, 0
+    for bill in bills:
+        due = bill["due_date"]
+        in_month = start <= due <= end
+        for payment in bill["payments"]:
+            if start <= payment["date"] <= end:
+                paid += payment["amount_cents"]
+                payments_count += 1
+                paid_month_bills += payment["amount_cents"] if in_month else 0
+        if due > end:
+            continue
+        value = debt_cents_at(bill, bill["payments"], max(reference, due)) or 0
+        late = value > 0 and due < overdue_cut
+        if not in_month and not value:
+            continue
+        items.append({"id": bill["id"], "value_cents": value, "carried": due < start, "overdue": late})
+        if late:
+            overdue += value
+            overdue_count += 1
+        else:
+            upcoming += value
+        if in_month:
+            group = groups["invoice" if bill["credit_card_id"] else bill["expense_type"]]
+            settled = sum(item["amount_cents"] for item in bill["payments"] if item["date"] <= reference)
+            group["total_cents"] += bill["amount_cents"]
+            group["paid_cents"] += min(settled, bill["amount_cents"])
+            group["remaining_cents"] += value
+            group["count"] += 1
+    fixed_income = sum(item["amount_cents"] for item in incomes
+        if item["income_type"] == "fixed" and start <= item["due_date"] <= end)
+    living = groups["fixed"]["total_cents"]
+    return {"month": start, "reference_date": reference, "remaining_cents": upcoming + overdue,
+        "upcoming_cents": upcoming, "overdue_cents": overdue, "overdue_count": overdue_count,
+        "paid_cents": paid, "paid_month_bills_cents": paid_month_bills, "payments_count": payments_count,
+        "fixed": groups["fixed"], "eventual": groups["eventual"], "invoice": groups["invoice"],
+        "fixed_income_cents": fixed_income,
+        "living_cost_share_bp": round(living * 10000 / fixed_income) if fixed_income else None,
+        "items": items}
+
+
+def income_month_summary(incomes: list[dict], received: list[dict], start: date, current: date) -> dict:
+    """received: income transactions dated in the month, with category and automatic_yield."""
+    end, reference, overdue_cut = month_reference(start, current)
+    categories: dict[str, int] = {}
+    for item in received:
+        categories[item["category"]] = categories.get(item["category"], 0) + item["amount_cents"]
+    items, upcoming, overdue = [], 0, 0
+    for income in incomes:
+        due = income["due_date"]
+        if due > end:
+            continue
+        received_until = sum(item["amount_cents"] for item in income["receipts"] if item["date"] <= reference)
+        remaining = max(0, income["amount_cents"] - received_until)
+        if due < start and not remaining:
+            continue
+        late = remaining > 0 and due < overdue_cut
+        items.append({"id": income["id"], "remaining_cents": remaining, "carried": due < start, "overdue": late})
+        if late:
+            overdue += remaining
+        else:
+            upcoming += remaining
+    return {"month": start, "reference_date": reference,
+        "received_cents": sum(item["amount_cents"] for item in received),
+        "yield_cents": sum(item["amount_cents"] for item in received if item["automatic_yield"]),
+        "expected_cents": upcoming + overdue, "upcoming_cents": upcoming, "overdue_cents": overdue,
+        "fixed_expected_cents": sum(item["amount_cents"] for item in incomes
+            if item["income_type"] == "fixed" and start <= item["due_date"] <= end),
+        "categories": sorted(({"category": key, "amount_cents": value} for key, value in categories.items()),
+            key=lambda item: -item["amount_cents"]),
+        "items": items}
+
+
+def debt_overview(bills: list[dict], current: date) -> dict:
+    end = add_months(current.replace(day=1), 1) - timedelta(days=1)
+    open_bills = [item for item in bills if item["status"] != "paid"]
+    overdue = [item for item in open_bills if item["status"] == "overdue"]
+    return {"total_cents": sum(item["current_cents"] or 0 for item in open_bills),
+        "this_month_cents": sum(item["current_cents"] or 0 for item in open_bills if item["due_date"] <= end),
+        "later_cents": sum(item["current_cents"] or 0 for item in open_bills if item["due_date"] > end),
+        "overdue_cents": sum(item["current_cents"] or 0 for item in overdue),
+        "overdue_count": len(overdue), "count": len(open_bills)}
 
 
 def forecast_series(balance_cents: int, bills: list[dict], incomes: list[dict], current: date,
@@ -679,19 +890,6 @@ def state(who=Depends(user), db=Depends(db_session)):
         FROM accounts a LEFT JOIN yield_rates r ON r.id=a.yield_rate_id
         LEFT JOIN transactions t ON t.account_id=a.id AND t.movement_type<>'card_purchase'
         GROUP BY a.id,r.id ORDER BY a.id DESC""", (current,))
-    transactions = all_rows(db, """SELECT t.*,py.transaction_id IS NOT NULL AS automatic_yield,
-        a.name AS account_name,COALESCE(c.name,t.category) AS category_name,cc.name AS card_name,
-        cp.installments,s.name AS subcategory_name FROM transactions t JOIN accounts a ON a.id=t.account_id
-        LEFT JOIN passive_yields py ON py.transaction_id=t.id
-        LEFT JOIN credit_cards cc ON cc.id=t.credit_card_id LEFT JOIN card_purchases cp ON cp.id=t.card_purchase_id
-        LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN subcategories s ON s.id=t.subcategory_id
-        ORDER BY t.date DESC,t.id DESC LIMIT 500""")
-    for transaction in transactions:
-        transaction["category"] = transaction["category_name"]
-    investments = all_rows(db, "SELECT * FROM investments ORDER BY id DESC")
-    for investment in investments:
-        investment["current_cents"] = projected_cents(investment["principal_cents"], investment["rate_basis_points"], investment["start_date"], current, investment["period"])
-        investment["future_cents"] = projected_cents(investment["principal_cents"], investment["rate_basis_points"], investment["start_date"], add_months(current, 12), investment["period"])
     bills = bill_rows(db, current)
     incomes = income_rows(db, current)
     categories = all_rows(db, "SELECT id,kind,name FROM categories ORDER BY kind,name")
@@ -699,24 +897,13 @@ def state(who=Depends(user), db=Depends(db_session)):
         last_checked_at,sync_error FROM yield_rates ORDER BY name""")
     subcategories = all_rows(db, "SELECT id,category_id,name FROM subcategories ORDER BY name")
     month_start = current.replace(day=1)
-    month_end = add_months(month_start, 1)
     month_totals_rows = all_rows(db, """SELECT kind,SUM(amount_cents)::bigint AS amount_cents FROM transactions
         WHERE date >= %s AND date <= %s AND movement_type IN ('regular','card_purchase')
         GROUP BY kind""", (month_start, current))
     month_totals = {"income_cents": 0, "expense_cents": 0}
     for item in month_totals_rows:
         month_totals[f"{item['kind']}_cents"] = item["amount_cents"]
-    spending = all_rows(db, """SELECT t.category_id,COALESCE(c.name,t.category) AS category,
-        t.subcategory_id,s.name AS subcategory,SUM(t.amount_cents)::bigint AS amount_cents
-        FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
-        LEFT JOIN subcategories s ON s.id=t.subcategory_id
-        WHERE t.kind='expense' AND t.date >= %s AND t.date < %s AND t.date <= %s
-        AND t.movement_type IN ('regular','card_purchase')
-        GROUP BY t.category_id,COALESCE(c.name,t.category),t.subcategory_id,s.name ORDER BY amount_cents DESC""", (month_start, month_end, current))
-    investment_series = [{"date": add_months(current, i), "value_cents": sum(projected_cents(x["principal_cents"], x["rate_basis_points"], x["start_date"], add_months(current, i), x["period"]) or 0 for x in investments)} for i in range(13)]
     debt_series = [{"date": add_months(current, i), "value_cents": sum(debt_cents_at(x, x["payments"], add_months(current, i)) or 0 for x in bills)} for i in range(13)]
-    due_series = monthly_payables(bills, current)
-    income_series = monthly_receivables(incomes, current)
     users = all_rows(db, "SELECT id,name,email,role,active FROM users ORDER BY id") if who["role"] == "admin" else []
     credit_cards = card_rows(db, current)
     card_purchases = all_rows(db, """SELECT p.*,cc.name AS card_name,
@@ -726,13 +913,11 @@ def state(who=Depends(user), db=Depends(db_session)):
         FROM card_purchases p JOIN credit_cards cc ON cc.id=p.credit_card_id
         JOIN transactions t ON t.card_purchase_id=p.id JOIN bills b ON b.id=t.invoice_bill_id
         GROUP BY p.id,cc.name ORDER BY p.purchase_date DESC,p.id DESC LIMIT 300""", (current,))
-    return jsonable_encoder({"user": who, "today": current, "accounts": accounts, "transactions": transactions,
-        "credit_cards": credit_cards, "card_purchases": card_purchases,
-        "investments": investments, "bills": bills, "incomes": incomes, "income_series": income_series,
-        "categories": categories, "subcategories": subcategories,
-        "yield_rates": yield_rates,
-        "monthly_spending": spending, "monthly_totals": month_totals, "investment_series": investment_series,
-        "debt_series": debt_series, "due_series": due_series, "users": users})
+    # Month pages load their own summaries (/api/*/month); this payload only carries shared records.
+    return json_response({"user": who, "today": current, "accounts": accounts,
+        "credit_cards": credit_cards, "card_purchases": card_purchases, "bills": bills, "incomes": incomes,
+        "categories": categories, "subcategories": subcategories, "yield_rates": yield_rates,
+        "monthly_totals": month_totals, "debt_series": debt_series, "users": users})
 
 
 def account_forecast(db, current: date, account_id: int | None) -> list[dict]:
@@ -755,7 +940,7 @@ def forecast(accountId: int | None = None, who=Depends(user), db=Depends(db_sess
     materialize_fixed_incomes(db, current)
     if accountId is not None and not one(db, "SELECT id FROM accounts WHERE id=%s", (accountId,)):
         fail(404, "Conta não encontrada.")
-    return jsonable_encoder({"account_id": accountId, "series": [{key: value for key, value in item.items()
+    return json_response({"account_id": accountId, "series": [{key: value for key, value in item.items()
         if not key.endswith("items")} for item in account_forecast(db, current, accountId)]})
 
 
@@ -787,7 +972,7 @@ def dashboard(month: str | None = None, accountId: int | None = None,
         point["income_items"] = [{**item, "description": incomes[item["id"]]["description"],
             "account_name": incomes[item["id"]]["account_name"], "due_date": incomes[item["id"]]["due_date"]}
             for item in point["income_items"]]
-        return jsonable_encoder({"mode": "forecast", "month": start, "account_id": accountId, "forecast": point,
+        return json_response({"mode": "forecast", "month": start, "account_id": accountId, "forecast": point,
             "series": [{key: value for key, value in item.items() if not key.endswith("items")} for item in series]})
     totals = {"income_cents": 0, "expense_cents": 0, "yield_cents": 0, "transaction_count": 0}
     summary = one(db, """SELECT COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='income'),0)::bigint AS income_cents,
@@ -812,13 +997,14 @@ def dashboard(month: str | None = None, accountId: int | None = None,
         WHERE date >= %s AND date < %s AND date <= %s AND (%s::bigint IS NULL OR account_id=%s)
         AND movement_type IN ('regular','card_purchase')
         GROUP BY date,kind ORDER BY date""", (start, end, current, accountId, accountId))
-    recent = all_rows(db, """SELECT t.id,t.account_id,t.kind,t.description,t.amount_cents,t.date,
+    recent = all_rows(db, """SELECT t.id,t.account_id,t.kind,COALESCE(cp.description,t.description) AS description,
+        COALESCE(cp.total_cents,t.amount_cents) AS amount_cents,t.date,
         t.payment_method,t.movement_type,COALESCE(c.name,t.category) AS category,a.name AS account_name,
         py.transaction_id IS NOT NULL AS automatic_yield FROM transactions t
         JOIN accounts a ON a.id=t.account_id LEFT JOIN categories c ON c.id=t.category_id
-        LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        LEFT JOIN passive_yields py ON py.transaction_id=t.id LEFT JOIN card_purchases cp ON cp.id=t.card_purchase_id
         WHERE t.date >= %s AND t.date < %s AND t.date <= %s
-        AND t.movement_type IN ('regular','card_purchase')
+        AND t.movement_type IN ('regular','card_purchase') AND (t.card_purchase_id IS NULL OR t.installment_number=1)
         AND (%s::bigint IS NULL OR t.account_id=%s)
         ORDER BY t.date DESC,t.id DESC LIMIT 12""", (start, end, current, accountId, accountId))
     accounts = all_rows(db, """SELECT a.id,a.name,a.type,
@@ -828,16 +1014,105 @@ def dashboard(month: str | None = None, accountId: int | None = None,
         AND t.movement_type<>'card_purchase'
         WHERE (%s::bigint IS NULL OR a.id=%s) GROUP BY a.id ORDER BY balance_cents DESC""",
         (cutoff, accountId, accountId))
-    bills = [item for item in bill_rows(db, current) if start <= item["due_date"] < end
-        and (accountId is None or item["account_id"] == accountId)]
-    incomes = [item for item in income_rows(db, current) if start <= item["due_date"] < end
-        and (accountId is None or item["account_id"] == accountId)]
-    return jsonable_encoder({"mode": "actual", "month": start, "account_id": accountId, "totals": totals,
+    all_bills = [item for item in bill_rows(db, current) if accountId is None or item["account_id"] == accountId]
+    all_incomes = [item for item in income_rows(db, current) if accountId is None or item["account_id"] == accountId]
+    bills = [item for item in all_bills if start <= item["due_date"] < end]
+    incomes = [item for item in all_incomes if start <= item["due_date"] < end]
+    month_bills = bill_month_summary(all_bills, all_incomes, start, current)
+    month_incomes = income_month_summary(all_incomes, [], start, current)
+    cards = []
+    for card in card_rows(db, current):
+        if accountId is not None and card["payment_account_id"] != accountId:
+            continue
+        invoices = sorted((item for item in all_bills if item["credit_card_id"] == card["id"]
+            and item["status"] != "paid"), key=lambda item: item["due_date"])
+        cards.append({key: card[key] for key in ("id", "name", "limit_cents", "used_cents", "available_cents",
+            "closing_day", "due_day", "payment_account_name")} | {"invoice": invoices[0] if invoices else None,
+            "open_invoices_cents": sum(item["current_cents"] or 0 for item in invoices)})
+    return json_response({"mode": "actual", "month": start, "account_id": accountId, "totals": totals,
         "categories": categories, "days": days, "recent": recent, "accounts": accounts,
+        "debt": debt_overview(all_bills, current), "cards": cards,
+        "bills_month": {key: value for key, value in month_bills.items() if key != "items"},
+        "incomes_month": {key: value for key, value in month_incomes.items() if key not in ("items", "categories")},
         "planned": {"bills_cents": sum(item["current_cents"] or 0 for item in bills if item["status"] != "paid"),
             "income_cents": sum(item["remaining_cents"] for item in incomes),
             "bills_count": sum(item["status"] != "paid" for item in bills),
             "income_count": sum(item["remaining_cents"] > 0 for item in incomes)}})
+
+
+def refresh_derived(db, current: date):
+    materialize_fixed_bills(db, current)
+    materialize_fixed_incomes(db, current)
+    sync_dynamic_rates(db, current)
+    accrue_passive_yields(db)
+
+
+def month_query(month: str | None, current: date) -> date:
+    start, _ = month_bounds(month, current)
+    if (start.year - current.year) * 12 + start.month - current.month > FORECAST_MONTHS:
+        fail(400, f"A consulta alcança até {FORECAST_MONTHS} meses à frente.")
+    return start
+
+
+@app.get("/api/bills/month")
+def bills_month(month: str | None = None, who=Depends(user), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    refresh_derived(db, current)
+    start = month_query(month, current)
+    first = one(db, "SELECT min(due_date) AS first FROM bills WHERE archived=FALSE")["first"]
+    summary = bill_month_summary(bill_rows(db, current), income_rows(db, current), start, current)
+    return json_response({**summary, "first_month": (first or current).replace(day=1), "today": current})
+
+
+@app.get("/api/incomes/month")
+def incomes_month(month: str | None = None, who=Depends(user), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    refresh_derived(db, current)
+    start = month_query(month, current)
+    end = add_months(start, 1)
+    received = all_rows(db, """SELECT t.amount_cents,COALESCE(c.name,t.category) AS category,
+        py.transaction_id IS NOT NULL AS automatic_yield FROM transactions t
+        LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        WHERE t.kind='income' AND t.movement_type='regular' AND t.date >= %s AND t.date < %s AND t.date <= %s""",
+        (start, end, current))
+    first = one(db, "SELECT min(due_date) AS first FROM planned_incomes WHERE archived=FALSE")["first"]
+    summary = income_month_summary(income_rows(db, current), received, start, current)
+    return json_response({**summary, "first_month": (first or current).replace(day=1), "today": current})
+
+
+@app.get("/api/transactions/month")
+def transactions_month(month: str | None = None, who=Depends(user), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    start, end = month_bounds(month, current)
+    # Day-to-day entries only: bill payments, receipts, transfers and automatic yields have their own pages.
+    rows = all_rows(db, """SELECT t.*,a.name AS account_name,COALESCE(c.name,t.category) AS category_name,
+        s.name AS subcategory_name,cc.name AS card_name,cp.installments,cp.total_cents AS purchase_total_cents,
+        cp.description AS purchase_description FROM transactions t JOIN accounts a ON a.id=t.account_id
+        LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN subcategories s ON s.id=t.subcategory_id
+        LEFT JOIN credit_cards cc ON cc.id=t.credit_card_id LEFT JOIN card_purchases cp ON cp.id=t.card_purchase_id
+        WHERE t.date >= %s AND t.date < %s AND t.bill_id IS NULL AND t.planned_income_id IS NULL
+        AND t.movement_type IN ('regular','card_purchase') AND (t.card_purchase_id IS NULL OR t.installment_number=1)
+        AND NOT EXISTS (SELECT 1 FROM passive_yields py WHERE py.transaction_id=t.id)
+        ORDER BY t.date DESC,t.id DESC""", (start, end))
+    by_method = {"pix": 0, "debit": 0, "credit": 0}
+    by_category: dict[str, int] = {}
+    for row in rows:
+        row["category"] = row.pop("category_name")
+        if row["card_purchase_id"]:
+            row["amount_cents"] = row["purchase_total_cents"]
+            row["description"] = row["purchase_description"]
+        if row["kind"] == "expense":
+            if row["payment_method"] in by_method:
+                by_method[row["payment_method"]] += row["amount_cents"]
+            by_category[row["category"]] = by_category.get(row["category"], 0) + row["amount_cents"]
+    expenses = [row for row in rows if row["kind"] == "expense"]
+    return json_response({"month": start, "today": current, "items": rows,
+        "expense_cents": sum(row["amount_cents"] for row in expenses),
+        "income_cents": sum(row["amount_cents"] for row in rows if row["kind"] == "income"),
+        "today_expense_cents": sum(row["amount_cents"] for row in expenses if row["date"] == current),
+        "expense_count": len(expenses), "by_method": by_method,
+        "by_category": sorted(({"category": key, "amount_cents": value} for key, value in by_category.items()),
+            key=lambda item: -item["amount_cents"])})
 
 
 @app.get("/api/accounts/{account_id}/details")
@@ -886,7 +1161,7 @@ def account_details(account_id: int, month: str | None = None, offset: int = 0,
         JOIN credit_cards cc ON cc.id=p.credit_card_id WHERE cc.payment_account_id=%s
         AND (%s::date IS NULL OR p.purchase_date >= %s) AND (%s::date IS NULL OR p.purchase_date < %s)
         ORDER BY p.purchase_date DESC,p.id DESC LIMIT 50""", (account_id, start, start, end, end))
-    return jsonable_encoder({"account": account, "history": history, "history_count": count,
+    return json_response({"account": account, "history": history, "history_count": count,
         "cards": cards, "card_purchases": card_purchases,
         "summary": summary, "projection": projection, "today": current, "month": start, "offset": offset})
 
@@ -1456,6 +1731,8 @@ def delete_transaction(transaction_id: int, who=Depends(mutation), db=Depends(db
     if existing["card_purchase_id"]:
         remove_card_purchase(db, existing["card_purchase_id"])
         return {"ok": True}
+    if one(db, "SELECT id FROM investment_movements WHERE transaction_id=%s", (transaction_id,)):
+        fail(409, "Exclua este movimento na página de investimentos.")
     if existing["transfer_group"]:
         accounts = [row["account_id"] for row in all_rows(db,
             "DELETE FROM transactions WHERE transfer_group=%s RETURNING account_id", (existing["transfer_group"],))]
@@ -1578,24 +1855,146 @@ def delete_card_purchase(purchase_id: int, who=Depends(mutation), db=Depends(db_
     return {"ok": True}
 
 
-@app.post("/api/investments", status_code=201)
-def create_investment(value: dict, who=Depends(mutation), db=Depends(db_session)):
+def investment_fields(value: dict) -> tuple:
     period = value.get("period")
     if period not in ("daily", "monthly", "yearly"):
         fail(400, "Periodicidade inválida.")
-    rate = integer(value.get("rateBasisPoints"), "Taxa", -9999, 100000)
-    result = one(db, """INSERT INTO investments(name,type,principal_cents,rate_basis_points,period,start_date,note)
-        VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id""", (text(value.get("name"), "Nome do investimento"),
-        text(value.get("type"), "Tipo", 60), integer(value.get("principalCents"), "Valor inicial"), rate,
-        period, parsed_date(value.get("startDate")), note(value.get("note"))))
-    return {"id": result["id"]}
+    return (text(value.get("name"), "Nome do investimento"), text(value.get("type"), "Tipo", 60),
+        integer(value.get("rateBasisPoints"), "Taxa", -9999, 100000), period, note(value.get("note")))
+
+
+def add_investment_movement(db, investment: dict, direction: str, amount: int, when: date,
+                            account_id: int | None, movement_note: str) -> int:
+    transaction_id = None
+    if account_id is not None:
+        if not one(db, "SELECT id FROM accounts WHERE id=%s", (account_id,)) \
+                or one(db, "SELECT id FROM credit_cards WHERE collateral_account_id=%s", (account_id,)):
+            fail(400, "Conta inválida.")
+        label = "Aporte em" if direction == "deposit" else "Resgate de"
+        transaction_id = one(db, """INSERT INTO transactions(account_id,kind,description,category,note,amount_cents,
+            date,movement_type) VALUES(%s,%s,%s,'Transferência',%s,%s,%s,'transfer') RETURNING id""",
+            (account_id, "expense" if direction == "deposit" else "income", f"{label} {investment['name']}",
+             movement_note, amount, when))["id"]
+    return one(db, """INSERT INTO investment_movements(investment_id,direction,amount_cents,date,account_id,
+        transaction_id,note) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (investment["id"], direction, amount, when, account_id, transaction_id, movement_note))["id"]
+
+
+def optional_account(value: dict) -> int | None:
+    account = value.get("accountId") or None
+    return integer(account, "Conta") if account is not None else None
+
+
+@app.post("/api/investments", status_code=201)
+def create_investment(value: dict, who=Depends(mutation), db=Depends(db_session)):
+    name, kind_name, rate, period, investment_note = investment_fields(value)
+    amount = integer(value.get("principalCents"), "Valor inicial")
+    when = parsed_date(value.get("startDate"))
+    if when > today(os.getenv("APP_TIMEZONE", "America/Araguaina")):
+        fail(400, "Registre o aporte na data em que ele acontecer.")
+    investment = one(db, """INSERT INTO investments(name,type,principal_cents,rate_basis_points,period,start_date,note,
+        movements_seeded) VALUES(%s,%s,%s,%s,%s,%s,%s,TRUE) RETURNING *""",
+        (name, kind_name, amount, rate, period, when, investment_note))
+    add_investment_movement(db, investment, "deposit", amount, when, optional_account(value), "")
+    return {"id": investment["id"]}
+
+
+@app.patch("/api/investments/{investment_id}")
+def edit_investment(investment_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    if not one(db, """UPDATE investments SET name=%s,type=%s,rate_basis_points=%s,period=%s,note=%s
+        WHERE id=%s RETURNING id""", (*investment_fields(value), investment_id)):
+        fail(404, "Investimento não encontrado.")
+    return {"ok": True}
+
+
+@app.post("/api/investments/{investment_id}/movements", status_code=201)
+def move_investment(investment_id: int, value: dict, who=Depends(mutation), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    investment = one(db, "SELECT * FROM investments WHERE id=%s FOR UPDATE", (investment_id,))
+    if not investment:
+        fail(404, "Investimento não encontrado.")
+    direction = value.get("direction")
+    if direction not in ("deposit", "withdraw"):
+        fail(400, "Movimento inválido.")
+    amount = integer(value.get("amountCents"), "Valor")
+    when = parsed_date(value.get("date"))
+    if when > current:
+        fail(400, "Registre o movimento na data em que ele acontecer.")
+    movements = all_rows(db, "SELECT * FROM investment_movements WHERE investment_id=%s", (investment_id,))
+    if direction == "withdraw" and amount > investment_value(investment, movements, when):
+        fail(400, "Resgate acima do valor do investimento nessa data.")
+    return {"id": add_investment_movement(db, investment, direction, amount, when, optional_account(value),
+        note(value.get("note")))}
+
+
+@app.delete("/api/investments/{investment_id}/movements/{movement_id}")
+def delete_investment_movement(investment_id: int, movement_id: int, who=Depends(mutation), db=Depends(db_session)):
+    investment = one(db, "SELECT * FROM investments WHERE id=%s FOR UPDATE", (investment_id,))
+    movement = one(db, "DELETE FROM investment_movements WHERE id=%s AND investment_id=%s RETURNING *",
+        (movement_id, investment_id))
+    if not investment or not movement:
+        fail(404, "Movimento não encontrado.")
+    if movement["transaction_id"]:
+        db.execute("DELETE FROM transactions WHERE id=%s", (movement["transaction_id"],))
+    remaining = all_rows(db, "SELECT * FROM investment_movements WHERE investment_id=%s", (investment_id,))
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    if investment_value(investment, remaining, current) < 0:
+        fail(409, "Excluir este aporte deixaria o investimento negativo. Exclua o resgate antes.")
+    return {"ok": True}
 
 
 @app.delete("/api/investments/{investment_id}")
 def delete_investment(investment_id: int, who=Depends(mutation), db=Depends(db_session)):
+    # Account transfers stay in the account history; only the box and its movements are removed.
     if not one(db, "DELETE FROM investments WHERE id=%s RETURNING id", (investment_id,)):
         fail(404, "Investimento não encontrado.")
     return {"ok": True}
+
+
+@app.get("/api/investments/summary")
+def investments_summary(who=Depends(user), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    sync_dynamic_rates(db, current)
+    accrue_passive_yields(db)
+    month_start = current.replace(day=1)
+    boxes = investment_rows(db, current)
+    accounts = all_rows(db, """SELECT a.id,a.name,a.type,a.yield_multiplier_basis_points,r.name AS yield_rate_name,
+        r.annual_basis_points,cc.id AS card_id,cc.name AS card_name,
+        a.opening_cents + COALESCE((SELECT SUM(CASE WHEN t.kind='income' THEN t.amount_cents ELSE -t.amount_cents END)
+            FROM transactions t WHERE t.account_id=a.id AND t.date<=%s AND t.movement_type<>'card_purchase'),0) AS balance_cents,
+        COALESCE((SELECT SUM(p.amount_cents) FROM passive_yields p WHERE p.account_id=a.id),0)::bigint AS yield_cents,
+        COALESCE((SELECT SUM(p.amount_cents) FROM passive_yields p WHERE p.account_id=a.id AND p.date>=%s),0)::bigint
+            AS month_yield_cents
+        FROM accounts a JOIN yield_rates r ON r.id=a.yield_rate_id
+        LEFT JOIN credit_cards cc ON cc.collateral_account_id=a.id ORDER BY a.id""", (current, month_start))
+    items, series = [], [0] * 13
+    for box in boxes:
+        values = [investment_value(box, box["movements"], add_months(current, i)) for i in range(13)]
+        series = [a + b for a, b in zip(series, values)]
+        items.append({"kind": "box", "id": box["id"], "name": box["name"], "type": box["type"],
+            "value_cents": box["current_cents"], "invested_cents": box["invested_cents"],
+            "yield_cents": box["yield_cents"], "month_yield_cents": box["month_yield_cents"],
+            "next_month_yield_cents": box["next_month_yield_cents"], "future_cents": values[12],
+            "rate_label": f"{box['rate_basis_points'] / 100:g}% {PERIOD_LABELS[box['period']]}"})
+    for account in accounts:
+        projection = fixed_rate_projection(account["balance_cents"], account["annual_basis_points"],
+            account["yield_multiplier_basis_points"], current)
+        values = [point["value_cents"] for point in projection]
+        series = [a + b for a, b in zip(series, values)]
+        annual = account["annual_basis_points"] * account["yield_multiplier_basis_points"] / 10000
+        items.append({"kind": "collateral" if account["card_id"] else "account", "id": account["id"],
+            "card_id": account["card_id"], "name": account["card_name"] and f"Limite garantido · {account['card_name']}"
+            or account["name"], "type": account["type"], "value_cents": account["balance_cents"],
+            "invested_cents": account["balance_cents"] - account["yield_cents"], "yield_cents": account["yield_cents"],
+            "month_yield_cents": account["month_yield_cents"], "next_month_yield_cents": values[1] - values[0],
+            "future_cents": values[12], "rate_label": f"{account['yield_multiplier_basis_points'] / 100:g}% de "
+            f"{account['yield_rate_name']} · {annual / 100:.2f}% a.a."})
+    return json_response({"today": current, "items": items, "boxes": boxes,
+        "total_cents": sum(item["value_cents"] for item in items),
+        "yield_cents": sum(item["yield_cents"] for item in items),
+        "month_yield_cents": sum(item["month_yield_cents"] for item in items),
+        "next_month_yield_cents": sum(item["next_month_yield_cents"] for item in items),
+        "series": [{"date": add_months(current, i), "value_cents": value} for i, value in enumerate(series)]})
 
 
 @app.post("/api/users", status_code=201)
