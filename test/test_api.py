@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from app.main import (app, bcb_observations, category_choice, daily_yield_cents, materialize_fixed_bills,
+from app.main import (app, bcb_observations, category_choice, daily_yield_cents, fixed_rate_projection, materialize_fixed_bills,
                       materialize_fixed_incomes, monthly_payables, monthly_receivables,
                       verify_password, yield_start)
 
@@ -78,7 +78,8 @@ class ApiTests(unittest.TestCase):
 
     def test_expected_routes_exist(self):
         paths = {route.path for route in app.routes}
-        self.assertTrue({"/health", "/api/state", "/api/categories", "/api/subcategories", "/api/bills/{bill_id}/classification"} <= paths)
+        self.assertTrue({"/health", "/api/state", "/api/dashboard", "/api/accounts/{account_id}/details",
+            "/api/categories", "/api/subcategories", "/api/bills/{bill_id}/classification"} <= paths)
 
     def test_fixed_expense_repeats_monthly_from_original_day(self):
         db = FakeRecurringBills()
@@ -116,6 +117,14 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(bcb_observations("cdi", date(2026, 10, 14)), [(date(2026, 10, 13), 1365)])
         self.assertIn("bcdata.sgs.4389", request.call_args.args[0])
         self.assertIn("dataFinal=14%2F10%2F2026", request.call_args.args[0])
+
+    def test_account_projection_holds_rate_and_respects_original_month_end(self):
+        points = fixed_rate_projection(100000, 1200, 10000, date(2026, 1, 31), 2)
+        self.assertEqual([point["date"] for point in points],
+            [date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31)])
+        self.assertGreater(points[2]["value_cents"], points[1]["value_cents"])
+        self.assertEqual(fixed_rate_projection(100000, None, 10000, date(2026, 1, 31)),
+            [{"date": date(2026, 1, 31), "value_cents": 100000, "yield_cents": 0}])
 
 
 if __name__ == "__main__":

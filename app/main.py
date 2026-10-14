@@ -289,6 +289,36 @@ def monthly_receivables(incomes: list[dict], current: date) -> list[dict]:
     return series
 
 
+def month_bounds(value: str | None, current: date) -> tuple[date, date]:
+    if value is None:
+        start = current.replace(day=1)
+    elif not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+        fail(400, "Mês inválido.")
+    else:
+        start = parsed_date(f"{value}-01")
+    return start, add_months(start, 1)
+
+
+def fixed_rate_projection(balance: int, annual_points: int | None, multiplier: int,
+                          current: date, months: int = 12) -> list[dict]:
+    """Project the current balance with the present rate held constant and no cash flows."""
+    series = [{"date": current, "value_cents": balance, "yield_cents": 0}]
+    if annual_points is None:
+        return series
+    amount = balance
+    cursor = current + timedelta(days=1)
+    previous = balance
+    for offset in range(1, months + 1):
+        end = add_months(current, offset)
+        while cursor <= end:
+            if is_business_day(cursor):
+                amount += daily_yield_cents(amount, annual_points, multiplier)
+            cursor += timedelta(days=1)
+        series.append({"date": end, "value_cents": amount, "yield_cents": amount - previous})
+        previous = amount
+    return series
+
+
 YIELD_ZONE = ZoneInfo("America/Sao_Paulo")
 BCB_SERIES = {"cdi": 4389, "selic_target": 432}
 
@@ -532,6 +562,109 @@ def state(who=Depends(user), db=Depends(db_session)):
         "yield_rates": yield_rates,
         "monthly_spending": spending, "monthly_totals": month_totals, "investment_series": investment_series,
         "debt_series": debt_series, "due_series": due_series, "users": users})
+
+
+@app.get("/api/dashboard")
+def dashboard(month: str | None = None, accountId: int | None = None,
+              who=Depends(user), db=Depends(db_session)):
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    materialize_fixed_bills(db, current)
+    materialize_fixed_incomes(db, current)
+    sync_dynamic_rates(db, current)
+    accrue_passive_yields(db)
+    start, end = month_bounds(month, current)
+    cutoff = min(end - timedelta(days=1), current)
+    if accountId is not None and not one(db, "SELECT id FROM accounts WHERE id=%s", (accountId,)):
+        fail(404, "Conta não encontrada.")
+    totals = {"income_cents": 0, "expense_cents": 0, "yield_cents": 0, "transaction_count": 0}
+    summary = one(db, """SELECT COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='income'),0)::bigint AS income_cents,
+        COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='expense'),0)::bigint AS expense_cents,
+        COALESCE(SUM(t.amount_cents) FILTER (WHERE py.transaction_id IS NOT NULL),0)::bigint AS yield_cents,
+        COUNT(*)::bigint AS transaction_count FROM transactions t
+        LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        WHERE t.date >= %s AND t.date < %s AND t.date <= %s
+        AND (%s::bigint IS NULL OR t.account_id=%s)""", (start, end, current, accountId, accountId))
+    totals.update(summary)
+    categories = all_rows(db, """SELECT t.kind,t.category_id,COALESCE(c.name,t.category) AS category,
+        t.subcategory_id,s.name AS subcategory,SUM(t.amount_cents)::bigint AS amount_cents
+        FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
+        LEFT JOIN subcategories s ON s.id=t.subcategory_id
+        WHERE t.date >= %s AND t.date < %s AND t.date <= %s
+        AND (%s::bigint IS NULL OR t.account_id=%s)
+        GROUP BY t.kind,t.category_id,COALESCE(c.name,t.category),t.subcategory_id,s.name
+        ORDER BY amount_cents DESC""", (start, end, current, accountId, accountId))
+    days = all_rows(db, """SELECT date,kind,SUM(amount_cents)::bigint AS amount_cents FROM transactions
+        WHERE date >= %s AND date < %s AND date <= %s AND (%s::bigint IS NULL OR account_id=%s)
+        GROUP BY date,kind ORDER BY date""", (start, end, current, accountId, accountId))
+    recent = all_rows(db, """SELECT t.id,t.account_id,t.kind,t.description,t.amount_cents,t.date,
+        COALESCE(c.name,t.category) AS category,a.name AS account_name,
+        py.transaction_id IS NOT NULL AS automatic_yield FROM transactions t
+        JOIN accounts a ON a.id=t.account_id LEFT JOIN categories c ON c.id=t.category_id
+        LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        WHERE t.date >= %s AND t.date < %s AND t.date <= %s
+        AND (%s::bigint IS NULL OR t.account_id=%s)
+        ORDER BY t.date DESC,t.id DESC LIMIT 12""", (start, end, current, accountId, accountId))
+    accounts = all_rows(db, """SELECT a.id,a.name,a.type,
+        a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income' THEN t.amount_cents
+        ELSE -t.amount_cents END),0) AS balance_cents
+        FROM accounts a LEFT JOIN transactions t ON t.account_id=a.id AND t.date <= %s
+        WHERE (%s::bigint IS NULL OR a.id=%s) GROUP BY a.id ORDER BY balance_cents DESC""",
+        (cutoff, accountId, accountId))
+    bills = [item for item in bill_rows(db, current) if start <= item["due_date"] < end
+        and (accountId is None or item["account_id"] == accountId)]
+    incomes = [item for item in income_rows(db, current) if start <= item["due_date"] < end
+        and (accountId is None or item["account_id"] == accountId)]
+    return jsonable_encoder({"month": start, "account_id": accountId, "totals": totals,
+        "categories": categories, "days": days, "recent": recent, "accounts": accounts,
+        "planned": {"bills_cents": sum(item["current_cents"] or 0 for item in bills if item["status"] != "paid"),
+            "income_cents": sum(item["remaining_cents"] for item in incomes),
+            "bills_count": sum(item["status"] != "paid" for item in bills),
+            "income_count": sum(item["remaining_cents"] > 0 for item in incomes)}})
+
+
+@app.get("/api/accounts/{account_id}/details")
+def account_details(account_id: int, month: str | None = None, offset: int = 0,
+                    who=Depends(user), db=Depends(db_session)):
+    if offset < 0 or offset > 100000:
+        fail(400, "Página inválida.")
+    current = today(os.getenv("APP_TIMEZONE", "America/Araguaina"))
+    sync_dynamic_rates(db, current)
+    accrue_passive_yields(db)
+    account = one(db, """SELECT a.*,r.name AS yield_rate_name,r.annual_basis_points,
+        r.source_code,r.source_date,
+        a.opening_cents + COALESCE(SUM(CASE WHEN t.kind='income' THEN t.amount_cents
+        ELSE -t.amount_cents END),0) AS balance_cents
+        FROM accounts a LEFT JOIN yield_rates r ON r.id=a.yield_rate_id
+        LEFT JOIN transactions t ON t.account_id=a.id AND t.date<=%s
+        WHERE a.id=%s GROUP BY a.id,r.id""", (current, account_id))
+    if not account:
+        fail(404, "Conta não encontrada.")
+    start, end = month_bounds(month, current) if month else (None, None)
+    history = all_rows(db, """WITH ordered AS (
+        SELECT t.*,a.opening_cents + SUM(CASE WHEN t.kind='income' THEN t.amount_cents
+            ELSE -t.amount_cents END) OVER (ORDER BY t.date,t.id) AS balance_after_cents,
+            py.transaction_id IS NOT NULL AS automatic_yield
+        FROM transactions t JOIN accounts a ON a.id=t.account_id
+        LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        WHERE t.account_id=%s AND t.date<=%s)
+        SELECT o.*,COALESCE(c.name,o.category) AS category_name,s.name AS subcategory_name
+        FROM ordered o LEFT JOIN categories c ON c.id=o.category_id
+        LEFT JOIN subcategories s ON s.id=o.subcategory_id
+        WHERE (%s::date IS NULL OR o.date >= %s) AND (%s::date IS NULL OR o.date < %s)
+        ORDER BY o.date DESC,o.id DESC LIMIT 50 OFFSET %s""",
+        (account_id, current, start, start, end, end, offset))
+    count = one(db, """SELECT COUNT(*)::bigint AS count FROM transactions WHERE account_id=%s AND date<=%s
+        AND (%s::date IS NULL OR date >= %s) AND (%s::date IS NULL OR date < %s)""",
+        (account_id, current, start, start, end, end))["count"]
+    summary = one(db, """SELECT COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='income'),0)::bigint AS income_cents,
+        COALESCE(SUM(t.amount_cents) FILTER (WHERE t.kind='expense'),0)::bigint AS expense_cents,
+        COALESCE(SUM(t.amount_cents) FILTER (WHERE py.transaction_id IS NOT NULL),0)::bigint AS yield_cents
+        FROM transactions t LEFT JOIN passive_yields py ON py.transaction_id=t.id
+        WHERE t.account_id=%s AND t.date<=%s""", (account_id, current))
+    projection = fixed_rate_projection(account["balance_cents"], account["annual_basis_points"],
+        account["yield_multiplier_basis_points"], current)
+    return jsonable_encoder({"account": account, "history": history, "history_count": count,
+        "summary": summary, "projection": projection, "today": current, "month": start, "offset": offset})
 
 
 @app.get("/api/cron/passive-yields")
