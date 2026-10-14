@@ -163,7 +163,11 @@ def user(request: Request, db=Depends(db_session)):
 
 def check_origin(request: Request):
     origin = request.headers.get("origin")
-    if origin and urlsplit(origin).netloc != request.headers.get("host"):
+    if not origin:
+        return
+    # ALLOWED_ORIGINS: domínios do front que repassam /api para cá (ex.: rewrite da Vercel), separados por vírgula.
+    allowed = {request.headers.get("host")} | {urlsplit(o.strip()).netloc for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()}
+    if urlsplit(origin).netloc not in allowed:
         fail(403, "Origem não permitida.")
 
 
